@@ -25,6 +25,13 @@ use tokio_util::codec::Decoder;
 /// per-stream timeout (issue #625).
 const SYN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Client sessions that discard more than this for already-closed streams
+/// (and have no live stream) are closed. After a saturated download the peer
+/// can still hold tens of MiB for the abandoned stream, and a reused session
+/// queues the next SynAck behind it past [`SYN_WATCHDOG_TIMEOUT`]; closing
+/// the connection makes the peer drop the backlog at once.
+const ABANDONED_DATA_CLOSE_THRESHOLD: usize = 256 * 1024;
+
 /// Type alias for new stream callback channel
 type NewStreamCallback =
     Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Arc<Stream>>>>>;
@@ -98,6 +105,9 @@ pub struct Session {
     // deadline task holding `Weak<Session>` closes the session on expiry.
     // Sync mutex — held only across abort/store, never across an await.
     syn_watchdog: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+
+    // Bytes received for already-closed streams since the last `open_stream`.
+    abandoned_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl Session {
@@ -169,6 +179,7 @@ impl Session {
             heartbeat: heartbeat_state,
             close_notify: Arc::new(Notify::new()),
             syn_watchdog: std::sync::Mutex::new(None),
+            abandoned_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -210,6 +221,7 @@ impl Session {
             heartbeat: None,
             close_notify: Arc::new(Notify::new()),
             syn_watchdog: std::sync::Mutex::new(None),
+            abandoned_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -455,6 +467,25 @@ impl Session {
         Ok(())
     }
 
+    /// Close the session once it has discarded more than
+    /// [`ABANDONED_DATA_CLOSE_THRESHOLD`] for closed streams and no stream is
+    /// still open on it.
+    async fn drop_draining_session(&self, len: usize) {
+        let discarded = self
+            .abandoned_bytes
+            .fetch_add(len, std::sync::atomic::Ordering::Relaxed)
+            + len;
+        if discarded <= ABANDONED_DATA_CLOSE_THRESHOLD || self.has_active_streams().await {
+            return;
+        }
+        tracing::debug!(
+            session_id = self.id(),
+            discarded,
+            "[Session] Closing session still draining data for closed streams"
+        );
+        let _ = self.close().await;
+    }
+
     /// Handle an incoming frame from connection
     async fn handle_frame(&self, frame: Frame) -> Result<()> {
         let session_id = self.id();
@@ -522,6 +553,11 @@ impl Session {
                         frame.stream_id,
                         receive_map.keys().collect::<Vec<_>>()
                     );
+                    drop(receive_map);
+                    if self.is_client {
+                        self.drop_draining_session(data_len).await;
+                    }
+                    return Ok(());
                 }
                 drop(receive_map);
                 tracing::trace!(
@@ -878,6 +914,8 @@ impl Session {
         let stream_id = self
             .stream_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.abandoned_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
             "[Session] Opening new stream {} (client={})",
             stream_id,
@@ -2003,6 +2041,57 @@ mod tests {
         // …and so does the cell, so the next session advertises the new md5
         // instead of provoking another update frame.
         assert_eq!(padding.read().await.md5(), pushed.md5());
+    }
+
+    fn idle_client_session() -> Arc<Session> {
+        Arc::new(Session::new_client(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            create_test_padding().into_shared(),
+            None,
+        ))
+    }
+
+    /// Past the threshold of data for already-closed streams, with no live
+    /// stream, the session is closed so the peer drops its backlog.
+    #[tokio::test]
+    async fn client_closes_session_draining_abandoned_stream_data() {
+        let session = idle_client_session();
+        let chunk = Bytes::from(vec![0u8; 16 * 1024]);
+
+        session
+            .handle_frame(Frame::data(1, chunk.clone()))
+            .await
+            .unwrap();
+        assert!(!session.is_closed(), "a short tail is tolerated");
+
+        for _ in 0..ABANDONED_DATA_CLOSE_THRESHOLD / chunk.len() {
+            session
+                .handle_frame(Frame::data(1, chunk.clone()))
+                .await
+                .unwrap();
+        }
+        assert!(session.is_closed());
+    }
+
+    /// A session still serving a live stream is never torn down for another
+    /// stream's leftovers.
+    #[tokio::test]
+    async fn abandoned_data_does_not_close_session_with_live_stream() {
+        let session = idle_client_session();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let reader = crate::session::StreamReader::new(2, rx);
+        let (live, _synack) = Stream::new(2, reader, session.stream_data_tx.clone());
+        session.streams.write().await.insert(2, Arc::new(live));
+
+        let chunk = Bytes::from(vec![0u8; 64 * 1024 - 1]);
+        for _ in 0..=ABANDONED_DATA_CLOSE_THRESHOLD / chunk.len() {
+            session
+                .handle_frame(Frame::data(1, chunk.clone()))
+                .await
+                .unwrap();
+        }
+        assert!(!session.is_closed());
     }
 
     /// An unparsable scheme leaves the previous one in force.
