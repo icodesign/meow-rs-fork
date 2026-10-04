@@ -1,6 +1,6 @@
 //! AnyTLS Client implementation
 
-use crate::client::{SessionPool, SessionPoolConfig};
+use crate::client::{SessionLease, SessionPool, SessionPoolConfig};
 use crate::padding::{PaddingFactory, SharedPaddingFactory};
 use crate::session::{Session, SessionHeartbeatConfig};
 use crate::util::{
@@ -100,10 +100,12 @@ impl Client {
         );
 
         // Get or create a session
-        let session = self.create_stream().await?;
+        let lease = self.create_stream().await?;
+        let session = Arc::clone(&lease.session);
         tracing::debug!("[Client] Got session for proxy stream");
 
         let stream = Self::open_proxy_stream(&session, destination, payload).await?;
+        lease.attach_to_stream(&stream);
         Ok((stream, session))
     }
 
@@ -245,7 +247,7 @@ impl Client {
     }
 
     /// Create a new stream by establishing or reusing a session
-    pub async fn create_stream(&self) -> Result<Arc<Session>> {
+    pub async fn create_stream(&self) -> Result<SessionLease> {
         // Try to get an idle session from pool
         if let Some(session) = self.session_pool.get_idle_session().await {
             tracing::debug!("[Client] Reusing idle session from pool");
@@ -271,7 +273,7 @@ impl Client {
 
     /// Create a new session with the server. `None` when a pool reset ran
     /// while it was being dialled: the session was closed, not pooled.
-    async fn create_new_session(&self) -> Result<Option<Arc<Session>>> {
+    async fn create_new_session(&self) -> Result<Option<SessionLease>> {
         tracing::debug!("[Client] Creating new session to {}", self.server_addr);
         let generation = self.session_pool.generation();
 
@@ -352,19 +354,16 @@ impl Client {
         // orphan a running session that no reaper owns. Close it on drop.
         let mut guard = SessionCloseGuard::new(session.clone());
 
-        // Store in pool
-        if !self
+        let Some(lease) = self
             .session_pool
-            .add_idle_session_from(session.clone(), generation)
+            .add_leased_session_from(session.clone(), generation)
             .await
-        {
+        else {
             tracing::debug!("[Client] Pool reset during dial; closing the new session");
             return Ok(None);
-        }
+        };
         guard.disarm();
-        tracing::debug!("[Client] Session added to pool");
-
-        Ok(Some(session))
+        Ok(Some(lease))
     }
 
     /// Build and start a client session on an already-handshaken TLS

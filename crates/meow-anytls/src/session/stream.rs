@@ -19,6 +19,7 @@ struct WriteState {
     permits: PollSemaphore,
     flush: Option<oneshot::Receiver<Result<()>>>,
     waker: Option<Waker>,
+    close_hook: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 /// Retire a registered stream if opening it fails or its dial is cancelled.
@@ -81,6 +82,7 @@ impl Stream {
                     permits,
                     flush: None,
                     waker: None,
+                    close_hook: None,
                 }),
                 close_notify: Notify::new(),
                 synack_tx: Mutex::new(Some(synack_tx)),
@@ -119,6 +121,16 @@ impl Stream {
         self.write_state.lock().unwrap().closed
     }
 
+    pub(crate) fn set_close_hook(&self, hook: Box<dyn FnOnce() + Send + Sync>) {
+        let mut state = self.write_state.lock().unwrap();
+        if state.closed {
+            drop(state);
+            hook();
+        } else {
+            state.close_hook = Some(hook);
+        }
+    }
+
     fn mark_closed(&self, send_fin: bool) {
         let mut state = self.write_state.lock().unwrap();
         state.closed = true;
@@ -134,7 +146,11 @@ impl Stream {
                 .enqueue(Frame::control(Command::Fin, self.id), None, None);
         }
         let waker = state.waker.take();
+        let close_hook = state.close_hook.take();
         drop(state);
+        if let Some(hook) = close_hook {
+            hook();
+        }
         if let Some(waker) = waker {
             waker.wake();
         }
