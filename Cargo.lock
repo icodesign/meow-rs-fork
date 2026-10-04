@@ -2498,9 +2498,12 @@ name = "meow-dns"
 version = "0.23.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "dashmap",
  "futures",
+ "h2",
  "hickory-proto",
+ "http",
  "ipnet",
  "lru 0.18.4",
  "maxminddb",

@@ -398,6 +398,7 @@ enum Transport {
         addr: SocketAddr,
         sni: Arc<str>,
         path: Arc<str>,
+        h2: DohH2Slot,
     },
     RCode {
         code: ResponseCode,
@@ -453,7 +454,8 @@ impl DnsClient {
         }
     }
 
-    /// DNS over HTTPS (RFC 8484) — HTTP/1.1 POST application/dns-message.
+    /// DNS over HTTPS (RFC 8484) — POST application/dns-message over a pooled
+    /// HTTP/2 connection, or HTTP/1.1 when the upstream does not offer `h2`.
     #[cfg(feature = "encrypted")]
     pub fn doh(addr: SocketAddr, sni: &str, path: &str) -> Self {
         Self {
@@ -461,6 +463,7 @@ impl DnsClient {
                 addr,
                 sni: Arc::from(sni),
                 path: Arc::from(path),
+                h2: DohH2Slot::new(),
             },
             timeout: DEFAULT_QUERY_TIMEOUT,
             proxy: None,
@@ -513,10 +516,15 @@ impl DnsClient {
     /// pool is mid-checkout, in which case they close on the next checkout;
     /// a stream an in-flight query holds finishes that query (bounded by the
     /// per-query timeout) and is then closed instead of pooled. Non-blocking.
-    /// Returns the idle streams closed now. UDP, DoT and DoH open a socket
-    /// per query and pool nothing.
+    /// Returns the idle streams closed now. UDP and DoT open a socket per
+    /// query and pool nothing; DoH drops its pooled HTTP/2 connection.
     pub fn reset_connections(&self) -> usize {
-        self.tcp_pool.reset()
+        let closed = self.tcp_pool.reset();
+        match &self.transport {
+            #[cfg(feature = "encrypted")]
+            Transport::Doh { h2, .. } => closed + h2.reset(),
+            _ => closed,
+        }
     }
 
     /// Human-readable upstream identifier for API/UI surfaces.
@@ -892,8 +900,13 @@ impl DnsClient {
                 decode_validated_response(&response, expected)
             }
             #[cfg(feature = "encrypted")]
-            Transport::Doh { addr, sni, path } => {
-                let response = doh_exchange(*addr, sni, path, wire).await?;
+            Transport::Doh {
+                addr,
+                sni,
+                path,
+                h2,
+            } => {
+                let response = doh_exchange_pooled(h2, *addr, sni, path, wire).await?;
                 decode_validated_response(&response, expected)
             }
         }
@@ -1382,6 +1395,237 @@ async fn doh_exchange(
     Ok(body.to_vec())
 }
 
+/// How long the pooled DoH HTTP/2 connection may sit unused before it is
+/// replaced rather than reused (same rationale as [`TCP_POOL_IDLE_TIMEOUT`]).
+#[cfg(feature = "encrypted")]
+const DOH_H2_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// DoH over one pooled HTTP/2 connection per upstream. A TCP + TLS handshake
+/// per query (~3 RTT) stalled every rule-time IP lookup; the pooled
+/// connection answers in about one RTT and multiplexes concurrent queries.
+/// Upstreams that do not negotiate `h2` keep the one-shot [`doh_exchange`].
+#[cfg(feature = "encrypted")]
+async fn doh_exchange_pooled(
+    slot: &DohH2Slot,
+    addr: SocketAddr,
+    sni: &str,
+    path: &str,
+    wire: &[u8],
+) -> Result<Vec<u8>, ClientError> {
+    if slot.http1_only.load(Ordering::Acquire) {
+        return doh_exchange(addr, sni, path, wire).await;
+    }
+    let Some((send, id)) = slot.checkout(addr, sni).await? else {
+        return doh_exchange(addr, sni, path, wire).await;
+    };
+    let result = doh_h2_request(send, &doh_authority(addr, sni), path, wire).await;
+    if result.is_err() {
+        slot.discard(id).await;
+    }
+    result
+}
+
+/// One DoH POST over an HTTP/2 connection, returning the DNS message body
+/// (capped at [`MAX_DOH_RESPONSE_BYTES`], like the HTTP/1.1 path).
+#[cfg(feature = "encrypted")]
+async fn doh_h2_request(
+    send: h2::client::SendRequest<bytes::Bytes>,
+    authority: &str,
+    path: &str,
+    wire: &[u8],
+) -> Result<Vec<u8>, ClientError> {
+    let mut send = send.ready().await.map_err(h2_error)?;
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("https://{authority}{path}"))
+        .header(http::header::ACCEPT, "application/dns-message")
+        .header(http::header::CONTENT_TYPE, "application/dns-message")
+        .header(http::header::CONTENT_LENGTH, wire.len())
+        .header(http::header::USER_AGENT, "meow-rs")
+        .body(())
+        .map_err(|_| ClientError::Protocol("doh: invalid request uri"))?;
+    let (response, mut body) = send.send_request(request, false).map_err(h2_error)?;
+    body.send_data(bytes::Bytes::copy_from_slice(wire), true)
+        .map_err(h2_error)?;
+
+    let response = response.await.map_err(h2_error)?;
+    if response.status() != http::StatusCode::OK {
+        return Err(ClientError::Protocol("doh: non-200 status"));
+    }
+    let mut body = response.into_body();
+    let mut out = Vec::with_capacity(512);
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(h2_error)?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        out.extend_from_slice(&chunk);
+        if out.len() > MAX_DOH_RESPONSE_BYTES {
+            return Err(ClientError::Protocol("doh: response exceeds maximum size"));
+        }
+    }
+    Ok(out)
+}
+
+/// Map an `h2` failure, keeping the raw errno when it came from the socket.
+#[cfg(feature = "encrypted")]
+fn h2_error(error: h2::Error) -> ClientError {
+    let message = format!("doh h2: {error}");
+    ClientError::Io(error.into_io().unwrap_or_else(|| io::Error::other(message)))
+}
+
+/// `:authority` for a DoH request: the configured host, with the port only
+/// when it is not the HTTPS default.
+#[cfg(feature = "encrypted")]
+fn doh_authority(addr: SocketAddr, sni: &str) -> String {
+    let host = match addr.ip() {
+        _ if !sni.is_empty() => sni.to_owned(),
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    if addr.port() == 443 {
+        host
+    } else {
+        format!("{host}:{}", addr.port())
+    }
+}
+
+/// The pooled HTTP/2 connection of one DoH upstream.
+#[cfg(feature = "encrypted")]
+struct DohH2Slot {
+    conn: AsyncMutex<Option<DohH2Conn>>,
+    /// Set once the upstream negotiates HTTP/1.1 instead of `h2`.
+    http1_only: std::sync::atomic::AtomicBool,
+    /// Slot-local generation, bumped by [`DohH2Slot::reset`] (issue #695).
+    generation: AtomicU,
+    next_id: AtomicU,
+}
+
+#[cfg(feature = "encrypted")]
+struct DohH2Conn {
+    send: h2::client::SendRequest<bytes::Bytes>,
+    driver: tokio::task::JoinHandle<()>,
+    generation: PoolGeneration,
+    last_used: Instant,
+    id: Uint,
+}
+
+#[cfg(feature = "encrypted")]
+impl Drop for DohH2Conn {
+    fn drop(&mut self) {
+        // A silently dead connection must not outlive its slot entry.
+        self.driver.abort();
+    }
+}
+
+#[cfg(feature = "encrypted")]
+impl DohH2Slot {
+    fn new() -> Self {
+        Self {
+            conn: AsyncMutex::new(None),
+            http1_only: std::sync::atomic::AtomicBool::new(false),
+            generation: AtomicU::new(0),
+            next_id: AtomicU::new(0),
+        }
+    }
+
+    fn generation(&self) -> PoolGeneration {
+        PoolGeneration {
+            global: connection_generation(),
+            local: self.generation.load(Ordering::Acquire),
+        }
+    }
+
+    /// Retire the pooled connection; returns the connections closed now.
+    fn reset(&self) -> usize {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.conn
+            .try_lock()
+            .map_or(0, |mut conn| usize::from(conn.take().is_some()))
+    }
+
+    /// Lease the pooled connection, opening one when none is usable. The lock
+    /// is held across the connect so a burst of queries shares one handshake.
+    /// `None` when the upstream negotiated HTTP/1.1.
+    async fn checkout(
+        &self,
+        addr: SocketAddr,
+        sni: &str,
+    ) -> Result<Option<(h2::client::SendRequest<bytes::Bytes>, Uint)>, ClientError> {
+        let mut slot = self.conn.lock().await;
+        if let Some(lease) = self.lease_live(&mut slot) {
+            return Ok(Some(lease));
+        }
+        // Captured before the socket exists, like `TcpPool` (issue #695).
+        let generation = self.generation();
+        let config = TlsConfig {
+            alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
+            ..TlsConfig::new(sni)
+        };
+        let tls = TlsLayer::new(&config)
+            .map_err(|e| ClientError::Tls(format!("invalid SNI '{sni}': {e}")))?;
+        let tcp = factory().connect_tcp(addr).await?;
+        let stream = tls
+            .connect_typed(tcp)
+            .await
+            .map_err(|e| match e.into_transport() {
+                meow_transport::TransportError::Io(io_err) => ClientError::Io(io_err),
+                other => ClientError::Tls(other.to_string()),
+            })?;
+        if stream.ssl().selected_alpn_protocol() != Some(b"h2".as_slice()) {
+            self.http1_only.store(true, Ordering::Release);
+            return Ok(None);
+        }
+        let (send, connection) = h2::client::handshake(stream).await.map_err(h2_error)?;
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        // Retired mid-connect: serve this query but never pool the connection.
+        if generation == self.generation() {
+            *slot = Some(DohH2Conn {
+                send: send.clone(),
+                driver,
+                generation,
+                last_used: Instant::now(),
+                id,
+            });
+        }
+        Ok(Some((send, id)))
+    }
+
+    /// The pooled connection if it is current, open, and not idle-expired;
+    /// otherwise drop it.
+    fn lease_live(
+        &self,
+        slot: &mut Option<DohH2Conn>,
+    ) -> Option<(h2::client::SendRequest<bytes::Bytes>, Uint)> {
+        let generation = self.generation();
+        let now = Instant::now();
+        match slot {
+            Some(conn)
+                if conn.generation == generation
+                    && !conn.driver.is_finished()
+                    && now.duration_since(conn.last_used) < DOH_H2_IDLE_TIMEOUT =>
+            {
+                conn.last_used = now;
+                Some((conn.send.clone(), conn.id))
+            }
+            _ => {
+                *slot = None;
+                None
+            }
+        }
+    }
+
+    /// Drop the pooled connection after a failed query, unless another query
+    /// already replaced it.
+    async fn discard(&self, id: Uint) {
+        let mut slot = self.conn.lock().await;
+        if slot.as_ref().is_some_and(|conn| conn.id == id) {
+            *slot = None;
+        }
+    }
+}
+
 #[cfg(feature = "encrypted")]
 fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
@@ -1442,6 +1686,174 @@ mod tests {
             ttl,
             RData::CNAME(CNAME(target.parse().unwrap())),
         )
+    }
+
+    /// HTTP/2 client connection to an in-process DoH server over a duplex
+    /// pipe. The server answers each request with `status` and either the
+    /// request body echoed back or `reply_len` filler bytes, and reports
+    /// each request's (method, uri, content-type).
+    #[cfg(feature = "encrypted")]
+    async fn h2_doh_pair(
+        status: u16,
+        reply_len: Option<usize>,
+    ) -> (
+        h2::client::SendRequest<bytes::Bytes>,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<(http::Method, http::Uri, Option<String>)>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io)
+                .await
+                .expect("server handshake");
+            while let Some(accepted) = conn.accept().await {
+                let (request, mut respond) = accepted.expect("accept stream");
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let (parts, mut body) = request.into_parts();
+                    let mut received = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.expect("request body");
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                        received.extend_from_slice(&chunk);
+                    }
+                    let content_type = parts
+                        .headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let _ = seen_tx.send((parts.method, parts.uri, content_type));
+                    let reply = reply_len.map_or(received, |len| vec![0u8; len]);
+                    let response = http::Response::builder().status(status).body(()).unwrap();
+                    let mut send = respond.send_response(response, false).expect("respond");
+                    send.reserve_capacity(reply.len());
+                    let _ = send.send_data(bytes::Bytes::from(reply), true);
+                });
+            }
+        });
+        let (send, connection) = h2::client::handshake(client_io)
+            .await
+            .expect("client handshake");
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        (send, driver, seen_rx)
+    }
+
+    #[cfg(feature = "encrypted")]
+    #[test]
+    fn doh_authority_omits_default_port() {
+        let v4: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        assert_eq!(doh_authority(v4, "dns.example"), "dns.example");
+        assert_eq!(doh_authority(v4, ""), "1.1.1.1");
+        let v6: SocketAddr = "[2606:4700::1111]:8443".parse().unwrap();
+        assert_eq!(doh_authority(v6, ""), "[2606:4700::1111]:8443");
+    }
+
+    /// Concurrent RFC 8484 POSTs share one HTTP/2 connection.
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_h2_request_multiplexes_posts_on_one_connection() {
+        let (send, _driver, mut seen) = h2_doh_pair(200, None).await;
+        let queries: Vec<Vec<u8>> = (0u8..8).map(|i| vec![i; 40]).collect();
+        let replies = futures::future::join_all(
+            queries
+                .iter()
+                .map(|wire| doh_h2_request(send.clone(), "dns.example:44443", "/dns-query", wire)),
+        )
+        .await;
+        for (wire, reply) in queries.iter().zip(replies) {
+            assert_eq!(&reply.expect("doh reply"), wire);
+        }
+        let (method, uri, content_type) = seen.recv().await.unwrap();
+        assert_eq!(method, http::Method::POST);
+        assert_eq!(uri.to_string(), "https://dns.example:44443/dns-query");
+        assert_eq!(content_type.as_deref(), Some("application/dns-message"));
+    }
+
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_h2_request_rejects_non_200_and_oversized_bodies() {
+        let (send, _driver, _seen) = h2_doh_pair(503, None).await;
+        let error = doh_h2_request(send, "dns.example", "/dns-query", b"q")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Protocol("doh: non-200 status")
+        ));
+
+        let (send, _driver, _seen) = h2_doh_pair(200, Some(MAX_DOH_RESPONSE_BYTES + 1)).await;
+        let error = doh_h2_request(send, "dns.example", "/dns-query", b"q")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Protocol("doh: response exceeds maximum size")
+        ));
+    }
+
+    /// Seat a duplex-backed connection in `slot` as `checkout` would.
+    #[cfg(feature = "encrypted")]
+    async fn seat_h2_conn(slot: &DohH2Slot) -> Uint {
+        let (send, driver, _seen) = h2_doh_pair(200, None).await;
+        let id = slot.next_id.fetch_add(1, Ordering::AcqRel);
+        *slot.conn.lock().await = Some(DohH2Conn {
+            send,
+            driver,
+            generation: slot.generation(),
+            last_used: Instant::now(),
+            id,
+        });
+        id
+    }
+
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_h2_slot_reuses_live_connection_and_discards_by_id() {
+        let slot = DohH2Slot::new();
+        let id = seat_h2_conn(&slot).await;
+        for _ in 0..3 {
+            let (send, leased) = slot.lease_live(&mut *slot.conn.lock().await).unwrap();
+            assert_eq!(leased, id);
+            let reply = doh_h2_request(send, "dns.example", "/dns-query", b"q").await;
+            assert_eq!(reply.unwrap(), b"q");
+        }
+
+        let current = seat_h2_conn(&slot).await;
+        slot.discard(id).await;
+        assert!(
+            slot.conn.lock().await.is_some(),
+            "a stale id keeps the replacement"
+        );
+        slot.discard(current).await;
+        assert!(slot.conn.lock().await.is_none());
+    }
+
+    #[cfg(feature = "encrypted")]
+    #[tokio::test]
+    async fn doh_h2_slot_drops_retired_idle_and_dead_connections() {
+        let slot = DohH2Slot::new();
+        seat_h2_conn(&slot).await;
+        assert_eq!(slot.reset(), 1, "reset closes the pooled connection now");
+
+        // Slot-local bump, not `reset_pooled_connections`: that global would
+        // retire other tests' pools mid-run.
+        seat_h2_conn(&slot).await;
+        slot.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(slot.lease_live(&mut *slot.conn.lock().await).is_none());
+
+        seat_h2_conn(&slot).await;
+        if let Some(stale) = Instant::now().checked_sub(DOH_H2_IDLE_TIMEOUT) {
+            slot.conn.lock().await.as_mut().unwrap().last_used = stale;
+            assert!(slot.lease_live(&mut *slot.conn.lock().await).is_none());
+        }
+
+        seat_h2_conn(&slot).await;
+        slot.conn.lock().await.as_ref().unwrap().driver.abort();
+        tokio::task::yield_now().await;
+        assert!(slot.lease_live(&mut *slot.conn.lock().await).is_none());
     }
 
     #[cfg(feature = "encrypted")]

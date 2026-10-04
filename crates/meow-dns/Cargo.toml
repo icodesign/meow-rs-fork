@@ -14,7 +14,7 @@ default = ["encrypted", "dns-server"]
 # DNS shares the process-wide backend (BoringSSL when the app is built with
 # `boring-tls` — the default — rustls otherwise) instead of carrying its own
 # rustls client config.
-encrypted = ["dep:meow-transport"]
+encrypted = ["dep:meow-transport", "dep:h2", "dep:http", "dep:bytes"]
 # `dns-server` historically gated hickory-server; the in-tree server now uses
 # only `hickory-proto`, so the feature is a no-op kept for API stability.
 dns-server = []
@@ -25,6 +25,10 @@ meow-trie = { workspace = true }
 tokio = { workspace = true }
 hickory-proto = { workspace = true }
 meow-transport = { workspace = true, features = ["tls"], optional = true }
+# DoH upstreams multiplex queries over one pooled HTTP/2 connection.
+h2 = { version = "0.4", optional = true }
+http = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 rand = { workspace = true }
 lru = { workspace = true }
 dashmap = { workspace = true }
