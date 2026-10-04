@@ -1143,12 +1143,12 @@ impl Tunnel {
 
     /// Spawn background tasks owned by the tunnel (currently just the UDP NAT
     /// sweeper). Idempotent callers should only invoke this once per process.
-    pub fn spawn_background_tasks(&self) {
-        udp::spawn_nat_sweeper(
+    pub fn spawn_background_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        vec![udp::spawn_nat_sweeper(
             &self.inner.nat_table,
             udp::DEFAULT_UDP_IDLE,
             udp::DEFAULT_SWEEP_INTERVAL,
-        );
+        )]
     }
 
     /// Store a running TUN listener handle. If a previous TUN listener was
