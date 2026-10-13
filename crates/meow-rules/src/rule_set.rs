@@ -20,7 +20,7 @@ use meow_trie::DomainTrie;
 use tracing::warn;
 
 use crate::ip_set::{IpRangeSet, IpRangeSetBuilder};
-use crate::parser::{parse_rule, ParserContext};
+use crate::parser::{condition_has_payload, insert_rule_adapter, parse_rule, ParserContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleSetBehavior {
@@ -543,8 +543,7 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
         // two already fail as unknown types here), and `payloadToRule`
         // rejects MATCH inside logic sub-rules at any depth (enforced in
         // `parse_logic_rule`).
-        let mut fields = entry.splitn(3, ',');
-        let first_field = fields.next().map_or("", str::trim);
+        let first_field = entry.split(',').next().map_or("", str::trim);
         if first_field == "MATCH" {
             return Err(format!(
                 "'{entry}': MATCH is not allowed in a classical rule-set"
@@ -554,19 +553,10 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
         // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
         // `DOMAIN-KEYWORD,` → contains("") — same as `FinalRule`). Same
         // class as MATCH — reject loudly (Class B, ADR-0002).
-        if fields.next().map_or("", str::trim).is_empty() {
+        if !condition_has_payload(entry) {
             return Err(format!("'{entry}': missing payload"));
         }
-        // Comma-safe upstream regex payloads cannot be spliced
-        // unambiguously — the truncated payload could still be a
-        // valid-but-different regex. Reject loudly (Class B, ADR-0002).
-        if first_field == "DOMAIN-REGEX" && fields.next().is_some() {
-            return Err(format!(
-                "'{entry}': {first_field} payloads containing commas are \
-                 not supported in a classical rule-set"
-            ));
-        }
-        let patched = splice_placeholder_adapter(entry);
+        let patched = insert_rule_adapter(entry, "RULE-SET-PLACEHOLDER");
         match parse_rule(&patched, self.ctx) {
             Ok(rule) => {
                 self.rules.push(rule);
@@ -625,33 +615,6 @@ impl RuleSet for ClassicalRuleSet {
     }
 }
 
-/// Turn `TYPE,PAYLOAD[,extra]` into `TYPE,PAYLOAD,RULE-SET-PLACEHOLDER[,extra]`
-/// so it satisfies `parse_rule`'s `type,payload,adapter[,extra]` shape.
-fn splice_placeholder_adapter(entry: &str) -> String {
-    const PLACEHOLDER: &str = "RULE-SET-PLACEHOLDER";
-    // Logic sub-rules carry their own parenthesised payload that must not
-    // be split on commas — append the placeholder at the end, same as
-    // `splice_inner_adapter` in parser.rs.
-    if let Some((ty, _)) = entry.split_once(',') {
-        let upper = ty.trim().to_ascii_uppercase();
-        if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            return format!("{entry},{PLACEHOLDER}");
-        }
-    }
-    let parts: Vec<&str> = entry.splitn(3, ',').collect();
-    match parts.as_slice() {
-        [ty, payload] => format!("{},{},{}", ty.trim(), payload.trim(), PLACEHOLDER),
-        [ty, payload, rest] => format!(
-            "{},{},{},{}",
-            ty.trim(),
-            payload.trim(),
-            PLACEHOLDER,
-            rest.trim()
-        ),
-        _ => entry.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,19 +670,6 @@ mod tests {
         assert_eq!(set.len(), 1, "the nested-MATCH entry must be dropped");
         assert!(!set.matches(&meta_host("nope.example"), &helper()));
         assert!(set.matches(&meta_host("fine.example"), &helper()));
-
-        // A comma-containing DOMAIN-REGEX payload cannot be represented —
-        // the entry must be rejected, not silently truncated to a
-        // different regex (`DOMAIN-REGEX,a,b` → regex "a").
-        let set = ClassicalRuleSet::from_entries(
-            &[
-                "DOMAIN-REGEX,a,b".to_string(),
-                "DOMAIN-SUFFIX,ok.example".to_string(),
-            ],
-            &ParserContext::empty(),
-        );
-        assert_eq!(set.len(), 1, "the ambiguous DOMAIN-REGEX must be dropped");
-        assert!(set.matches(&meta_host("ok.example"), &helper()));
 
         // Empty/missing payloads must not silently degrade to match-all
         // (`DOMAIN-SUFFIX,` → ends_with(""), `DOMAIN-KEYWORD,` →
@@ -804,6 +754,92 @@ mod tests {
         assert!(set.matches(&meta_host("mail.google.com"), &helper()));
         assert!(set.matches(&meta_ip("10.1.2.3"), &helper()));
         assert!(!set.matches(&meta_host("example.org"), &helper()));
+    }
+
+    #[test]
+    fn classical_rule_set_strict_builder_preserves_regex_commas() {
+        // A comma-containing regex stays intact in the strict builder too.
+        let ctx = ParserContext::empty();
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        builder.push_checked("DOMAIN-REGEX,^a,b$").unwrap();
+        let set = builder.build();
+        assert_eq!(set.len(), 1);
+        assert!(set.matches(&meta_host("a,b"), &helper()));
+        assert!(!set.matches(&meta_host("a"), &helper()));
+    }
+
+    #[test]
+    fn classical_rule_set_preserves_private_geosite_regex_quantifiers() {
+        let set = ClassicalRuleSet::from_entries(
+            &["DOMAIN-REGEX,^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$".to_string()],
+            &ParserContext::empty(),
+        );
+        assert_eq!(set.len(), 1);
+        assert!(set.matches(&meta_host("a"), &helper()));
+        assert!(set.matches(&meta_host(&"a".repeat(63)), &helper()));
+        assert!(!set.matches(&meta_host(&"a".repeat(64)), &helper()));
+        assert!(!set.matches(&meta_host("a-"), &helper()));
+        assert!(!set.matches(&meta_host("example.com"), &helper()));
+    }
+
+    #[test]
+    fn classical_rule_set_preserves_logic_payloads_with_regex_commas() {
+        let set = ClassicalRuleSet::from_entries(
+            &["AND,((DOMAIN-REGEX,^api[0-9]{1,3}\\.example$),(DST-PORT,443))".to_string()],
+            &ParserContext::empty(),
+        );
+        assert_eq!(set.len(), 1);
+        assert!(set.matches(&meta_host("api12.example"), &helper()));
+        let mut wrong_port = meta_host("api12.example");
+        wrong_port.dst_port = 80;
+        assert!(!set.matches(&wrong_port, &helper()));
+        assert!(!set.matches(&meta_host("api1234.example"), &helper()));
+    }
+
+    #[test]
+    fn classical_rule_set_ignores_extra_domain_columns_like_upstream() {
+        // Upstream classical entries keep only column 2 as the payload; a
+        // trailing policy column (common in Surge-style lists) or a stray
+        // trailing comma is an ignored option, not part of the domain.
+        for (entry, host) in [
+            ("DOMAIN,name.example,Proxy", "name.example"),
+            ("DOMAIN-SUFFIX,second.example,DIRECT", "sub.second.example"),
+            ("DOMAIN-SUFFIX,dokumentam24.ru,", "sub.dokumentam24.ru"),
+            ("DOMAIN-KEYWORD,literal,Proxy", "prefix-literal.example"),
+        ] {
+            let set = ClassicalRuleSet::from_entries(&[entry.to_string()], &ParserContext::empty());
+            assert_eq!(set.len(), 1);
+            assert!(set.matches(&meta_host(host), &helper()));
+            assert!(!set.matches(&meta_host("unrelated.example"), &helper()));
+        }
+    }
+
+    #[test]
+    fn classical_rule_set_preserves_cidr_no_resolve_option() {
+        let set = ClassicalRuleSet::from_entries(
+            &["IP-CIDR,10.0.0.0/8,no-resolve".to_string()],
+            &ParserContext::empty(),
+        );
+        assert_eq!(set.len(), 1);
+        assert!(set.matches(&meta_ip("10.1.2.3"), &helper()));
+        assert!(!set.matches(&meta_ip("11.1.2.3"), &helper()));
+        assert!(!set.should_resolve_ip());
+    }
+
+    #[test]
+    fn classical_rule_set_still_skips_malformed_entries() {
+        let set = ClassicalRuleSet::from_entries(
+            &[
+                "DOMAIN-REGEX,[a{1,3}".to_string(),
+                "IP-CIDR,invalid,no-resolve".to_string(),
+                "NOT,((DOMAIN,a),(DOMAIN,b))".to_string(),
+                "DOMAIN,valid.example".to_string(),
+            ],
+            &ParserContext::empty(),
+        );
+        assert_eq!(set.len(), 1);
+        assert!(set.matches(&meta_host("valid.example"), &helper()));
+        assert!(!set.matches(&meta_host("invalid.example"), &helper()));
     }
 
     #[test]

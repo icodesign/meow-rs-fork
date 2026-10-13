@@ -93,13 +93,27 @@ fn parse_rule_depth(
     if line.len() > MAX_RULE_LINE_LEN {
         return Err(format!("rule line exceeds {MAX_RULE_LINE_LEN} bytes"));
     }
-    // Logic rules (AND/OR/NOT) must be detected before the naive `splitn(4, ',')`
-    // below, because their payloads contain parenthesised sub-rules whose
-    // commas would be split incorrectly.
+    // Regex payloads can contain commas (quantifiers), so — like upstream
+    // `ParseRulePayload` — their adapter is the final column and they take
+    // no extra options. Logic rules instead carry a parenthesised payload
+    // with nested commas. Every other type keeps upstream's fixed columns.
     if let Some((ty, rest)) = split_once_trimmed(line, ',') {
         let upper = ty.to_ascii_uppercase();
         if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
             return parse_logic_rule(&upper, rest, ctx, logic_depth);
+        }
+        if is_comma_payload_rule(ty) {
+            let (payload, adapter) = rest
+                .rsplit_once(',')
+                .ok_or_else(|| format!("rule needs at least 3 parts: {line}"))?;
+            let payload = payload.trim();
+            let adapter = adapter.trim();
+            if adapter.is_empty() {
+                return Err(format!("{ty} rule: missing adapter"));
+            }
+            return DomainRegexRule::new(payload, adapter)
+                .map(|r| Box::new(r) as Box<dyn Rule>)
+                .map_err(|e| format!("invalid regex: {e}"));
         }
     }
 
@@ -125,12 +139,14 @@ fn parse_rule_depth(
     let extra = parts.get(3).map(|s| s.trim());
 
     match rule_type {
+        // Upstream treats any column after the adapter as options; domain
+        // rules take none, so extras are ignored.
         "DOMAIN" => Ok(Box::new(DomainRule::new(payload, adapter))),
         "DOMAIN-SUFFIX" => Ok(Box::new(DomainSuffixRule::new(payload, adapter))),
         "DOMAIN-KEYWORD" => Ok(Box::new(DomainKeywordRule::new(payload, adapter))),
-        "DOMAIN-REGEX" => DomainRegexRule::new(payload, adapter)
-            .map(|r| Box::new(r) as Box<dyn Rule>)
-            .map_err(|e| format!("invalid regex: {e}")),
+        "DOMAIN-WILDCARD" => {
+            DomainWildcardRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
+        }
         "IP-CIDR" | "IP-CIDR6" => {
             // Trailing `,src` (upstream `ParseParams`) makes the rule
             // source-axis, matching `SRC-IP-CIDR`.
@@ -193,9 +209,6 @@ fn parse_rule_depth(
         "PROCESS-PATH" => {
             ProcessPathRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
         }
-        "DOMAIN-WILDCARD" => {
-            DomainWildcardRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
-        }
         "IP-SUFFIX" => {
             let flags = parse_rule_flags(extra);
             IpSuffixRule::new(payload, adapter, flags.is_src, flags.no_resolve)
@@ -238,6 +251,13 @@ fn parse_rule_depth(
         }
         _ => Err(format!("unknown rule type: {rule_type}")),
     }
+}
+
+/// Rule types whose payload may itself contain commas. Mirrors the
+/// `DOMAIN-REGEX` arm of upstream `ParseRulePayload`; plain domain types
+/// split at the first comma and treat later columns as options.
+fn is_comma_payload_rule(rule_type: &str) -> bool {
+    rule_type == "DOMAIN-REGEX"
 }
 
 fn parse_asn_payload(payload: &str) -> Result<u32, String> {
@@ -353,8 +373,7 @@ fn parse_logic_rule(
         // Upstream `payloadToRule` rejects MATCH inside logic sub-rules —
         // it would splice into an always-true `FinalRule` leg. Nested
         // groups recurse through here, so the check covers any depth.
-        let mut fields = g.splitn(3, ',');
-        let first = fields.next().map_or("", str::trim);
+        let first = g.split(',').next().map_or("", str::trim);
         if first == "MATCH" {
             return Err(format!(
                 "{rule_type} rule: MATCH is not allowed inside logic groups"
@@ -364,21 +383,10 @@ fn parse_logic_rule(
         // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
         // `DOMAIN-KEYWORD,` → contains("")) — same class as MATCH.
         // Reject loudly.
-        if fields.next().map_or("", str::trim).is_empty() {
+        if !condition_has_payload(g) {
             return Err(format!("{rule_type} rule: '{g}' has no payload"));
         }
-        // Upstream comma-protects regex payloads (target = last field,
-        // payload = everything before it); our grammar splits payload at
-        // the first comma, so an inner entry with a comma in its payload
-        // would silently truncate (`DOMAIN-REGEX,a,b` → regex "a").
-        // Reject loudly instead.
-        if first == "DOMAIN-REGEX" && fields.next().is_some() {
-            return Err(format!(
-                "{rule_type} rule: {first} payloads containing commas are \
-                 not supported inside logic groups"
-            ));
-        }
-        let patched = splice_inner_adapter(g.trim());
+        let patched = insert_rule_adapter(g.trim(), "LOGIC-INNER-PLACEHOLDER");
         inner_rules.push(parse_rule_depth(&patched, ctx, logic_depth + 1)?);
     }
 
@@ -442,31 +450,35 @@ fn split_logic_groups(inner: &str) -> Result<Vec<String>, String> {
     Ok(groups)
 }
 
-/// Splice a placeholder adapter into `TYPE,PAYLOAD[,extra]` so the inner rule
-/// satisfies `parse_rule`'s `TYPE,PAYLOAD,ADAPTER[,extra]` shape. The owning
-/// logic/rule-set wrapper carries the real adapter; the placeholder is
-/// discarded at match time.
-fn splice_inner_adapter(entry: &str) -> String {
-    const PLACEHOLDER: &str = "LOGIC-INNER-PLACEHOLDER";
-    // Logic sub-rules carry their own parenthesised payload that must not be
-    // split on commas — their "adapter" slot is appended at the end.
-    if let Some((ty, _)) = entry.split_once(',') {
-        let upper = ty.trim().to_ascii_uppercase();
-        if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            return format!("{entry},{PLACEHOLDER}");
-        }
+/// Checks the adapter-free condition's payload without mistaking regex
+/// payload commas for option delimiters.
+pub(crate) fn condition_has_payload(entry: &str) -> bool {
+    let Some((ty, payload)) = entry.split_once(',') else {
+        return false;
+    };
+    let payload = if is_comma_payload_rule(ty.trim()) {
+        payload
+    } else {
+        payload.split(',').next().unwrap_or("")
+    };
+    !payload.trim().is_empty()
+}
+
+/// Adds the wrapper-owned adapter to a classical or nested logic condition,
+/// preserving payload delimiters and the optional extra-options column.
+pub(crate) fn insert_rule_adapter(entry: &str, adapter: &str) -> String {
+    let Some((ty, payload)) = entry.split_once(',') else {
+        return entry.to_string();
+    };
+    let ty = ty.trim();
+    let payload = payload.trim();
+    if is_comma_payload_rule(ty) || matches!(ty.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT")
+    {
+        return format!("{ty},{payload},{adapter}");
     }
-    let parts: Vec<&str> = entry.splitn(3, ',').collect();
-    match parts.as_slice() {
-        [ty, payload] => format!("{},{},{}", ty.trim(), payload.trim(), PLACEHOLDER),
-        [ty, payload, rest] => format!(
-            "{},{},{},{}",
-            ty.trim(),
-            payload.trim(),
-            PLACEHOLDER,
-            rest.trim()
-        ),
-        _ => entry.to_string(),
+    match payload.split_once(',') {
+        Some((value, extra)) => format!("{ty},{},{adapter},{}", value.trim(), extra.trim()),
+        None => format!("{ty},{payload},{adapter}"),
     }
 }
 
@@ -505,6 +517,56 @@ mod tests {
         assert!(rule.match_metadata(&meta, &noop_helper()));
         let meta2 = make_metadata("google.com", 443);
         assert!(rule.match_metadata(&meta2, &noop_helper()));
+    }
+
+    #[test]
+    fn test_parse_domain_regex_preserves_comma_quantifiers_and_adapter() {
+        let pattern = "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$";
+        let rule = parse_rule(&format!("DOMAIN-REGEX,{pattern},DIRECT"), &ctx()).unwrap();
+        assert_eq!(rule.payload(), pattern);
+        assert_eq!(rule.adapter(), "DIRECT");
+        assert!(rule.match_metadata(&make_metadata("host-name", 443), &noop_helper()));
+        assert!(!rule.match_metadata(&make_metadata("host.name", 443), &noop_helper()));
+    }
+
+    #[test]
+    fn test_parse_domain_regex_rejects_malformed_patterns_and_missing_adapter() {
+        for line in [
+            "DOMAIN-REGEX,[a{1,3},DIRECT",
+            "DOMAIN-REGEX,^example$",
+            "DOMAIN-REGEX,^example$,",
+        ] {
+            assert!(parse_rule(line, &ctx()).is_err(), "accepted {line}");
+        }
+    }
+
+    #[test]
+    fn test_parse_domain_payloads_ignore_extra_columns_like_upstream() {
+        // Upstream `ParseRulePayload`: payload = column 2, adapter = column 3,
+        // later columns are options that domain rules ignore.
+        for (line, payload, host) in [
+            (
+                "DOMAIN,name.example,DIRECT,extra",
+                "name.example",
+                "name.example",
+            ),
+            (
+                "DOMAIN-SUFFIX,dokumentam24.ru,DIRECT,",
+                "dokumentam24.ru",
+                "sub.dokumentam24.ru",
+            ),
+            (
+                "DOMAIN-KEYWORD,literal,DIRECT,extra",
+                "literal",
+                "prefix-literal.example",
+            ),
+        ] {
+            let rule = parse_rule(line, &ctx()).unwrap();
+            assert_eq!(rule.payload(), payload);
+            assert_eq!(rule.adapter(), "DIRECT");
+            assert!(rule.match_metadata(&make_metadata(host, 443), &noop_helper()));
+            assert!(!rule.match_metadata(&make_metadata("unrelated.example", 443), &noop_helper()));
+        }
     }
 
     #[test]
@@ -762,10 +824,9 @@ mod tests {
         assert!(parse_rule("OR,((MATCH,x),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
         // And at arbitrary nesting depth.
         assert!(parse_rule("AND,((NOT,((MATCH,x))),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
-        // A comma-containing DOMAIN-REGEX payload cannot be represented
-        // in our grammar — reject loudly rather than silently truncating
-        // to a different regex.
-        assert!(parse_rule("AND,((DOMAIN-REGEX,a,b),(DOMAIN,a.example)),Proxy", &ctx()).is_err());
+        // A comma is part of the regex payload, not an extra column.
+        let rule = parse_rule("AND,((DOMAIN-REGEX,a,b),(DOMAIN,a.example)),Proxy", &ctx()).unwrap();
+        assert!(!rule.match_metadata(&make_metadata("a.example", 443), &noop_helper()));
         // A comma-free DOMAIN-REGEX leg still parses.
         assert!(parse_rule("AND,((DOMAIN-REGEX,a+),(DOMAIN,a.example)),Proxy", &ctx()).is_ok());
         // An empty-payload leg would silently become match-all
