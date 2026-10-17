@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+# On-disk flow tracing for connection diagnostics (JSONL recording sessions).
+# Off by default — pulls in serde_json and is only useful to embedders that
+# expose a recording toggle (ADR-0007 binary-size caps).
+trace = ["dep:serde_json"]
+
 [dependencies]
 meow-common = { workspace = true }
 meow-dns = { workspace = true, default-features = false }
@@ -23,6 +29,7 @@ async-trait = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 smol_str = { workspace = true }
 smallvec = { workspace = true }
 time = { workspace = true }

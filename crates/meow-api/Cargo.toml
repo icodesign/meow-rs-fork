@@ -11,6 +11,8 @@ homepage.workspace = true
 [features]
 default = []
 listener-tun = ["meow-listener/listener-tun"]
+# Diagnostic flow-trace endpoints (`/traces/...`), forwarded to meow-tunnel.
+trace = ["meow-tunnel/trace"]
 
 [dependencies]
 meow-common = { workspace = true }

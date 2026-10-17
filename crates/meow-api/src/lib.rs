@@ -5,6 +5,8 @@
 
 pub mod log_stream;
 pub mod routes;
+#[cfg(feature = "trace")]
+pub mod traces;
 pub mod ui;
 
 use dashmap::DashMap;

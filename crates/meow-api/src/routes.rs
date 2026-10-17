@@ -275,11 +275,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_rule_provider).put(refresh_rule_provider),
         )
         // Listeners (read-only list)
-        .route("/listeners", get(get_listeners))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_auth_ws,
-        ));
+        .route("/listeners", get(get_listeners));
+
+    // Diagnostic flow tracing, when compiled in. Merged before the auth layer
+    // so these routes are authenticated like every other REST endpoint.
+    #[cfg(feature = "trace")]
+    let api = api.merge(crate::traces::routes());
+
+    let api = api.route_layer(middleware::from_fn_with_state(
+        Arc::clone(&state),
+        require_auth_ws,
+    ));
 
     // Web UI is intentionally unauthenticated so dashboards can load and then
     // present a token prompt; this matches upstream mihomo behaviour.

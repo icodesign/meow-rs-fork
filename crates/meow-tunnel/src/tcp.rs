@@ -335,6 +335,16 @@ async fn route_inbound_tcp_scoped<C>(
         note_inbound(&metadata);
     }
 
+    // Opt-in trace session (`trace` feature). Coexists with the notes above:
+    // notes narrate the connection for `GET /connections/{id}`, the flow
+    // guard records stage timings into the active on-disk session. Both are
+    // a single branch when off; without the feature the guard is a ZST.
+    let flow = crate::trace::FlowGuard::begin(inner.trace_recorder());
+    flow.observe(&metadata);
+    flow.capture_request(prefix);
+    flow.start_stage("pre_handle");
+    let pre_handle_started = flow.now();
+
     // Fake-IP → host rewrite (no-op outside fake-IP mode aside from a
     // snooping-cache hostname fill-in). An unmapped fake-IP destination
     // is dropped — dialing it loops back into a fake-IP-routed inbound
@@ -343,14 +353,24 @@ async fn route_inbound_tcp_scoped<C>(
         inner.pre_handle_metadata(&mut metadata),
         crate::tunnel::PreHandleVerdict::Drop
     ) {
+        flow.fail(&"stale fake-IP destination");
         return;
     }
 
+    flow.stage("pre_handle", pre_handle_started, || {
+        (!metadata.sniff_host.is_empty()).then(|| metadata.sniff_host.to_string())
+    });
     let admission = inner.tcp_admission();
+    flow.observe(&metadata);
+    flow.start_stage("rule_match");
+    let match_started = flow.now();
 
     // Match rules with lazy enrichment: DNS pre-resolution and process
     // lookup run only if the scan reaches a rule that demands them.
-    let Some(target) = inner.resolve_proxy_lazy(&mut metadata).await else {
+    let Some(target) = inner.resolve_proxy_lazy_traced(&mut metadata, &flow).await else {
+        flow.observe(&metadata);
+        flow.stage("rule_match", match_started, || None);
+        flow.fail(&"no matching rule");
         warn!(
             "{} no matching rule for {}",
             metadata.conn_type,
@@ -358,6 +378,12 @@ async fn route_inbound_tcp_scoped<C>(
         );
         return;
     };
+
+    flow.stage("rule_match", match_started, || {
+        Some(format!("{}({})", target.rule_name, target.rule_payload))
+    });
+    flow.observe(&metadata);
+    flow.set_outbound(target.adapter.name());
 
     info!(
         "{} --> {} match {}({}) using {}",
@@ -385,8 +411,11 @@ async fn route_inbound_tcp_scoped<C>(
     // API-only metadata and the proxy chain are built only when needed.
     let Some(guard) = admission.track_named(&metadata, rule_name, rule_payload, proxy.as_ref())
     else {
+        flow.fail(&"routing setup invalidated by config reload");
         return;
     };
+
+    flow.attach_counters(guard.counters());
 
     // Declare relay buffers on the future's stack frame — zero per-relay heap
     // allocation (ADR-0011 T6). Paid once at task-spawn, not at relay-call time.
@@ -406,13 +435,18 @@ async fn route_inbound_tcp_scoped<C>(
                 proxy.adapter_type()
             );
             let started = std::time::Instant::now();
+            flow.start_stage("dial");
+            let dial_started = flow.now();
             let dial = with_dial_timeout(proxy.name(), proxy.dial_tcp(&metadata)).await;
             // All chained front hops resolved during the dial — release the
             // generation pin before entering the relay loop.
             drop(route.take());
+            flow.stage("dial", dial_started, || Some(proxy.name().to_string()));
             match dial {
                 Ok(mut remote) => {
                     conn_note!(Dial, "Connected in {} ms", started.elapsed().as_millis());
+                    flow.start_stage("relay");
+                    let relay_started = flow.now();
                     let up = Arc::clone(guard.counters());
                     let dn = Arc::clone(guard.counters());
                     // Re-emit any bytes the listener already read past the handshake
@@ -424,6 +458,8 @@ async fn route_inbound_tcp_scoped<C>(
                     // (review M9).
                     if !prefix.is_empty() {
                         if let Err(e) = remote.write_all(prefix).await {
+                            flow.stage("relay", relay_started, || None);
+                            flow.fail(&e);
                             warn!(
                                 "{} {} prefix write error: {}",
                                 metadata.conn_type,
@@ -437,8 +473,16 @@ async fn route_inbound_tcp_scoped<C>(
                             .stats
                             .record_upload(&up, prefix.len() as meow_common::atomic::Int);
                     }
+                    // Pass-through wrapper: lets an opted-in HTTP trace
+                    // session sample request bytes the relay already read.
+                    // No extra reads, buffering or allocation; with the
+                    // feature off the hook is an empty inline call.
+                    let mut observed = RequestObservedStream {
+                        stream: conn,
+                        flow: &flow,
+                    };
                     match copy_bidirectional_buf_tracked(
-                        conn,
+                        &mut observed,
                         &mut remote,
                         &mut buf_up,
                         &mut buf_dn,
@@ -456,6 +500,8 @@ async fn route_inbound_tcp_scoped<C>(
                     .await
                     {
                         Ok((up, down)) => {
+                            flow.stage("relay", relay_started, || None);
+                            flow.succeed();
                             debug!(
                                 "{} {} relay closed: up={} down={}",
                                 metadata.conn_type,
@@ -466,6 +512,8 @@ async fn route_inbound_tcp_scoped<C>(
                             conn_note!(Relay, "Closed: {up} B up, {down} B down");
                         }
                         Err(e) => {
+                            flow.stage("relay", relay_started, || None);
+                            flow.fail(&e);
                             debug!(
                                 "{} {} relay error: {}",
                                 metadata.conn_type,
@@ -483,6 +531,7 @@ async fn route_inbound_tcp_scoped<C>(
                         metadata.remote_address(),
                         e
                     );
+                    flow.fail(&e);
                     conn_note!(
                         Dial,
                         "Failed after {} ms: {e}",
@@ -528,11 +577,96 @@ fn note_inbound(metadata: &Metadata) {
     }
 }
 
+/// Observes bytes already read by the relay; never performs another read or
+/// changes framing, buffering, timeouts, or TLS behavior.
+struct RequestObservedStream<'a, T> {
+    stream: &'a mut T,
+    flow: &'a crate::trace::FlowGuard,
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RequestObservedStream<'_, T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut *self.stream).poll_read(cx, buf);
+        if matches!(result, std::task::Poll::Ready(Ok(()))) {
+            self.flow.capture_request(&buf.filled()[before..]);
+        }
+        result
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RequestObservedStream<'_, T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.stream).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use meow_common::{ConnType, Network};
     use meow_proxy::DirectAdapter;
+
+    #[cfg(feature = "trace")]
+    #[tokio::test]
+    async fn request_observation_preserves_relay_bytes_and_redacts_only_the_sample() {
+        use crate::trace::{FlowGuard, TraceConfig, TraceStore};
+        use tokio::io::AsyncReadExt;
+        let directory = tempfile::tempdir().expect("directory");
+        let store =
+            TraceStore::new(TraceConfig::new(directory.path().to_path_buf())).expect("store");
+        let session = store.start_session_with_http(true).expect("start");
+        let flow = FlowGuard::begin(store.recorder());
+        let request =
+            b"GET /download HTTP/1.1\r\nAuthorization: Bearer secret\r\nRange: bytes=0-100\r\n\r\n";
+        let (mut sender, mut receiver) = tokio::io::duplex(128);
+        sender.write_all(request).await.expect("send");
+        sender.shutdown().await.expect("shutdown");
+        let mut observed = RequestObservedStream {
+            stream: &mut receiver,
+            flow: &flow,
+        };
+        let mut first = [0; 2];
+        observed.read_exact(&mut first).await.expect("read prefix");
+        let mut forwarded = first.to_vec();
+        observed
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("read remainder");
+        assert_eq!(
+            forwarded, request,
+            "observation must preserve actual relay bytes"
+        );
+        flow.succeed();
+        drop(flow);
+        store.stop_session(&session.session_id).expect("stop");
+        let (_, flows) = store
+            .read_flows(&session.session_id, 10, 0)
+            .expect("read sample");
+        let sample = flows[0].http_request_sample.as_ref().expect("sample");
+        assert!(!sample.text.contains("secret"));
+        assert!(sample.text.contains("Range: bytes=0-100"));
+    }
 
     fn metadata() -> Metadata {
         Metadata {

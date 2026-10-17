@@ -141,6 +141,12 @@ pub struct TunnelInner {
     /// Handle to the running TUN listener (if any). Abort + await it to
     /// stop TUN. Stored so `put_configs` can start/stop TUN at runtime.
     pub tun_handle: RwLock<Option<TunHandle>>,
+    /// Diagnostic flow recorder installed by the embedding host (`trace`
+    /// feature). Independent of `connection_notes`: notes are the live,
+    /// per-connection account served by `GET /connections/{id}`; traces are
+    /// opt-in recording sessions persisted to disk.
+    #[cfg(feature = "trace")]
+    pub trace: RwLock<Option<Arc<crate::trace::TraceStore>>>,
     /// Health-check task set keyed by group name; reconciled on every
     /// config commit so checks appear/disappear/respawn with the config
     /// (issue #514).
@@ -216,6 +222,21 @@ async fn teardown_tun(handle: TunHandle) {
 }
 
 impl TunnelInner {
+    /// Handle to the live trace recording session, if any. Always `None`
+    /// (and lock-free) when the `trace` feature is off.
+    #[inline]
+    pub fn trace_recorder(&self) -> Option<Arc<crate::trace::TraceRecorder>> {
+        #[cfg(feature = "trace")]
+        {
+            let store = Arc::clone(self.trace.read().as_ref()?);
+            store.recorder()
+        }
+        #[cfg(not(feature = "trace"))]
+        {
+            None
+        }
+    }
+
     /// Snapshot the current route table: one short read lock + `Arc` clone.
     /// The returned `Arc` is safe to hold across `.await` points.
     pub fn route(&self) -> Arc<RouteTable> {
@@ -448,6 +469,17 @@ impl TunnelInner {
     /// UDP paths must keep calling `pre_resolve`: their NAT session key
     /// requires a resolved `dst_ip` regardless of what the rules demand.
     pub async fn resolve_proxy_lazy(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
+        self.resolve_proxy_lazy_traced(metadata, &crate::trace::FlowGuard::disabled())
+            .await
+    }
+
+    /// [`Self::resolve_proxy_lazy`], recording any DNS enrichment the rule
+    /// scan demands as a `dns_resolve` stage of `flow`.
+    pub async fn resolve_proxy_lazy_traced(
+        &self,
+        metadata: &mut Metadata,
+        flow: &crate::trace::FlowGuard,
+    ) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
         if mode != TunnelMode::Rule {
             return self.resolve_proxy(metadata).await;
@@ -499,7 +531,16 @@ impl TunnelInner {
                     // `needs_ip` already encodes the `pre_resolve` guards:
                     // host present, dst_ip absent.
                     let started = std::time::Instant::now();
-                    if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
+                    let dns_started = flow.now();
+                    flow.start_stage("dns_resolve");
+                    let resolved = self.resolver().resolve_ip_real(&metadata.host).await;
+                    flow.stage("dns_resolve", dns_started, || {
+                        Some(resolved.map_or_else(
+                            || format!("{}: unresolved", metadata.host),
+                            |ip| format!("{} -> {ip}", metadata.host),
+                        ))
+                    });
+                    if let Some(real_ip) = resolved {
                         debug!("lazy resolve: {} -> {}", metadata.host, real_ip);
                         conn_note!(
                             Rule,
@@ -779,6 +820,8 @@ impl Tunnel {
                 needs_ip_resolution: AtomicBool::new(false),
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
+                #[cfg(feature = "trace")]
+                trace: RwLock::new(None),
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
@@ -796,6 +839,18 @@ impl Tunnel {
         self.inner
             .connection_notes
             .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Install or remove the embedding host's diagnostic trace store.
+    #[cfg(feature = "trace")]
+    pub fn set_trace_store(&self, store: Option<Arc<crate::trace::TraceStore>>) {
+        *self.inner.trace.write() = store;
+    }
+
+    /// The installed diagnostic trace store, if any.
+    #[cfg(feature = "trace")]
+    pub fn trace_store(&self) -> Option<Arc<crate::trace::TraceStore>> {
+        self.inner.trace.read().as_ref().map(Arc::clone)
     }
 
     pub fn inner(&self) -> &Arc<TunnelInner> {
