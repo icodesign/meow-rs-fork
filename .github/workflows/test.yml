@@ -279,6 +279,7 @@ jobs:
             --test offline_config_test \
             --test geodata_fetch_test \
             --test subscription_refresh_test \
+            --test rule_provider_refresh \
             --test tls_test \
             --test boring_tls_test \
             --test ws_test \

@@ -5428,6 +5428,7 @@ mod geoip_context_tests {
         providers.insert(
             "my-provider".to_string(),
             raw::RawRuleProvider {
+                size_limit: None,
                 provider_type: "inline".to_string(),
                 behavior: "classical".to_string(),
                 format: None,
@@ -5456,6 +5457,7 @@ mod geoip_context_tests {
     #[test]
     fn scan_lines_include_prefetched_provider_payloads() {
         let provider = || raw::RawRuleProvider {
+            size_limit: None,
             provider_type: "file".to_string(),
             behavior: "classical".to_string(),
             format: None,

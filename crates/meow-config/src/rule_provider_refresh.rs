@@ -181,12 +181,36 @@ async fn refresh_loop(
     interval_secs: u64,
     registry: Weak<RwLock<HashMap<String, Arc<RuleProvider>>>>,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    // The first tick is due one `interval` after the installed payload was
+    // fetched (or last attempted), not one `interval` after this task
+    // started: a provider restarted from a 23 h old cache with a 24 h
+    // interval refreshes in an hour, not in 24. A cache already at least
+    // `interval` old is revalidated by the provider's initial fetch
+    // (`RuleProvider::spawn_initial_fetch`), so that case — and an unknown
+    // age — waits a full interval here instead of fetching twice.
+    let first = registry
+        .upgrade()
+        .and_then(|registry| registry.read().get(&name).cloned())
+        .map_or(interval_secs, |provider| {
+            first_refresh_delay(
+                provider
+                    .last_attempt_at_secs()
+                    .max(provider.updated_at_secs()),
+                interval_secs,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+        });
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(first),
+        Duration::from_secs(interval_secs),
+    );
     // `Delay` — a suspend longer than `interval` must not fire every missed
     // tick back-to-back (a refresh storm of real HTTP fetches); same policy
     // as the health-check supervisor.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await; // skip the immediate first tick
     loop {
         ticker.tick().await;
         // Weak like the health-check loop: a supervisor that outlives its
@@ -209,6 +233,15 @@ async fn refresh_loop(
     }
 }
 
+/// Seconds until the first interval refresh of a provider last fetched at
+/// `last` (Unix seconds); see `refresh_loop`.
+fn first_refresh_delay(last: u64, interval_secs: u64, now: u64) -> u64 {
+    match last.saturating_add(interval_secs).checked_sub(now) {
+        Some(remaining) if remaining > 0 && remaining <= interval_secs => remaining,
+        _ => interval_secs,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +258,17 @@ mod tests {
         entries: &[(&str, ProviderType, u64)],
     ) -> Arc<RwLock<HashMap<String, Arc<RuleProvider>>>> {
         Arc::new(RwLock::new(registry_map(entries)))
+    }
+
+    #[test]
+    fn first_refresh_follows_the_payload_age() {
+        // Fetched 100 s ago with a 3600 s interval: due in 3500 s.
+        assert_eq!(first_refresh_delay(900, 3600, 1000), 3500);
+        // Stale (the initial fetch revalidates it), never fetched, or from
+        // the future (clock skew): a full interval.
+        assert_eq!(first_refresh_delay(1, 3600, 10_000), 3600);
+        assert_eq!(first_refresh_delay(0, 3600, 10_000), 3600);
+        assert_eq!(first_refresh_delay(20_000, 3600, 10_000), 3600);
     }
 
     #[tokio::test]

@@ -1750,6 +1750,7 @@ mod tests {
             raw.insert(
                 (*name).to_string(),
                 RawRuleProvider {
+                    size_limit: None,
                     provider_type: "inline".to_string(),
                     behavior: (*behavior).to_string(),
                     format: None,

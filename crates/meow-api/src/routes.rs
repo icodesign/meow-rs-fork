@@ -274,6 +274,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/providers/rules/{name}",
             get(get_rule_provider).put(refresh_rule_provider),
         )
+        .route(
+            "/providers/rules/{name}/contents",
+            get(get_rule_provider_contents),
+        )
         // Listeners (read-only list)
         .route("/listeners", get(get_listeners))
         .route_layer(middleware::from_fn_with_state(
@@ -3773,6 +3777,9 @@ async fn provider_proxy_healthcheck(
 #[derive(Serialize)]
 struct RuleProviderInfo {
     name: String,
+    /// File name of an http provider's on-disk cache (null otherwise).
+    #[serde(rename = "cacheFileName")]
+    cache_file_name: Option<String>,
     #[serde(rename = "type")]
     provider_type: String,
     behavior: String,
@@ -3783,10 +3790,24 @@ struct RuleProviderInfo {
     updated_at: String,
     #[serde(rename = "vehicleType")]
     vehicle_type: String,
+    /// `ready`, `refreshing` or `failed`.
+    state: String,
+    /// Refresh interval in seconds (`0`: none).
+    interval: u64,
+    #[serde(rename = "lastAttemptAt")]
+    last_attempt_at: Option<String>,
+    #[serde(rename = "nextUpdateAt")]
+    next_update_at: Option<String>,
+    /// The last attempt failed and the previous payload is still served.
+    #[serde(rename = "usingLastGood")]
+    using_last_good: bool,
+    #[serde(rename = "lastError")]
+    last_error: Option<String>,
 }
 
 impl RuleProviderInfo {
     fn from_provider(p: &Arc<RuleProvider>, format: Option<&str>) -> Self {
+        let status = p.status();
         let vehicle_type = match p.provider_type {
             meow_config::rule_provider::ProviderType::Http => "HTTP",
             meow_config::rule_provider::ProviderType::File => "File",
@@ -3794,14 +3815,45 @@ impl RuleProviderInfo {
         };
         Self {
             name: p.name.clone(),
+            cache_file_name: p.cache_file_name(),
             provider_type: "Rule".to_string(),
             behavior: p.behavior.to_string(),
             format: format.unwrap_or("yaml").to_string(),
             rule_count: p.rule_count(),
-            updated_at: unix_rfc3339(p.updated_at_secs()).unwrap_or_default(),
+            updated_at: unix_rfc3339(status.updated_at).unwrap_or_default(),
             vehicle_type: vehicle_type.to_string(),
+            state: status.state.to_string(),
+            interval: p.interval,
+            last_attempt_at: status.last_attempt_at.and_then(unix_rfc3339),
+            next_update_at: status.next_update_at.and_then(unix_rfc3339),
+            using_last_good: status.using_last_good,
+            last_error: status.last_error,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct RuleProviderContentsQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// Default and largest page of `GET /providers/rules/{name}/contents`.
+const RULE_PROVIDER_CONTENTS_DEFAULT_LIMIT: usize = 100;
+const RULE_PROVIDER_CONTENTS_MAX_LIMIT: usize = 500;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuleProviderContentsResponse {
+    name: String,
+    /// `false` when the provider has no inspectable text form (MRS, or an
+    /// http provider without an on-disk cache); `reason` says so.
+    available: bool,
+    reason: Option<String>,
+    total: usize,
+    offset: usize,
+    limit: usize,
+    rules: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -3862,6 +3914,53 @@ async fn refresh_rule_provider(
             StatusCode::SERVICE_UNAVAILABLE
         }
     }
+}
+
+/// `GET /providers/rules/{name}/contents?offset=&limit=` — one page of the
+/// provider's source entries (see `RuleProvider::preview_entries`).
+async fn get_rule_provider_contents(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(query): Query<RuleProviderContentsQuery>,
+) -> Result<Json<RuleProviderContentsResponse>, (StatusCode, String)> {
+    let provider = {
+        let providers = state.rule_providers.read();
+        providers.get(&name).cloned()
+    }
+    .ok_or((StatusCode::NOT_FOUND, "rule provider not found".to_string()))?;
+    let offset = query.offset.unwrap_or(0);
+    let limit = query
+        .limit
+        .unwrap_or(RULE_PROVIDER_CONTENTS_DEFAULT_LIMIT)
+        .clamp(1, RULE_PROVIDER_CONTENTS_MAX_LIMIT);
+    // Re-reads and parses the payload file: off the async workers.
+    let page = tokio::task::spawn_blocking(move || provider.preview_entries(offset, limit))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("contents task failed: {e}"),
+            )
+        })?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let (available, reason, total, rules) = match page {
+        Some((total, rules)) => (true, None, total, rules),
+        None => (
+            false,
+            Some("The provider has no inspectable text representation.".to_string()),
+            0,
+            Vec::new(),
+        ),
+    };
+    Ok(Json(RuleProviderContentsResponse {
+        name,
+        available,
+        reason,
+        total,
+        offset,
+        limit,
+        rules,
+    }))
 }
 
 // ── Listeners ─────────────────────────────────────────────────────────

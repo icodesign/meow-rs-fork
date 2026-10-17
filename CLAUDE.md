@@ -190,6 +190,7 @@ cargo test --lib --bin meow --bin meow-bench \
   --test offline_config_test \
   --test geodata_fetch_test \
   --test subscription_refresh_test \
+  --test rule_provider_refresh \
   --test tls_test --test boring_tls_test --test ws_test --test crate_invariants_test \
   --test crate_publish_metadata_test \
   --test smux_singbox_integration

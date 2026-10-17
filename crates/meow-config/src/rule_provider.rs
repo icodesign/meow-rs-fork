@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +28,8 @@ use meow_rules::{
     ParserContext, RuleSet, RuleSetBehavior, RuleSetFormat,
 };
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
 
@@ -56,6 +58,34 @@ impl std::fmt::Display for ProviderType {
             Self::Inline => write!(f, "inline"),
         }
     }
+}
+
+const STATUS_READY: u8 = 0;
+const STATUS_REFRESHING: u8 = 1;
+const STATUS_FAILED: u8 = 2;
+
+/// Longest `last_error` kept (characters); a refresh error can embed a
+/// whole response line.
+const MAX_ERROR_CHARS: usize = 512;
+
+/// Refresh status of one provider: what `GET /providers/rules` reports and
+/// what an http provider mirrors to `<cache>.status.json` so an embedder can
+/// show it without a running runtime. Timestamps are Unix seconds.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleProviderStatus {
+    pub name: String,
+    /// `ready`, `refreshing` or `failed`.
+    pub state: &'static str,
+    pub rule_count: usize,
+    /// When the installed payload was fetched (`0`: none yet).
+    pub updated_at: u64,
+    pub last_attempt_at: Option<u64>,
+    /// When the interval loop refreshes next (http with `interval` only).
+    pub next_update_at: Option<u64>,
+    /// The last attempt failed and an earlier payload is still served.
+    pub using_last_good: bool,
+    pub last_error: Option<String>,
 }
 
 /// HTTP fetch context for http providers, captured at load time and reused
@@ -133,6 +163,161 @@ pub struct RuleProvider {
     /// The remote fetch the load left owing, taken by
     /// [`Self::spawn_initial_fetch`] once the provider is committed.
     initial_fetch: parking_lot::Mutex<InitialFetch>,
+    /// Payload cap in bytes: `size-limit:` clamped to the internal HTTP
+    /// body cap. Applies to downloads, cache reads and file re-reads.
+    maximum_size: usize,
+    /// `<cache>.meta.json` / `<cache>.status.json` of an http provider with
+    /// an on-disk cache.
+    sidecars: Option<Arc<CacheSidecars>>,
+    /// Unix seconds of the last fetch attempt (`0`: none).
+    last_attempt_at: AtomicU,
+    /// `STATUS_*`.
+    state: AtomicU8,
+    last_error: RwLock<Option<String>>,
+    /// Whether a payload was ever installed (vs. registered empty).
+    loaded: AtomicBool,
+    /// Orders `<cache>.status.json` writes; see [`CacheSidecars`].
+    status_seq: AtomicUsize,
+    /// An inline provider's `payload:`, kept for the contents API.
+    inline_entries: Option<Arc<[String]>>,
+}
+
+/// The sidecar files next to an http provider's on-disk cache:
+///
+/// - `<cache>.meta.json` ([`CacheMetadata`]) binds the cached payload to the
+///   provider definition that fetched it and to its SHA-256, and records
+///   when it was fetched. A cache whose sidecar names a different source
+///   (an edited `url:`, `behavior:` …) or whose bytes no longer match is
+///   not served cache-first; a cache without a sidecar (written by an
+///   older build) is served as before, aged by its mtime.
+/// - `<cache>.status.json` mirrors [`RuleProvider::status`].
+///
+/// Writes are blocking and happen on blocking threads (or the synchronous
+/// load path). The meta file is only written under `meta`'s lock with the
+/// digest of the payload last written to the cache; status writes carry a
+/// sequence number so a slower, older snapshot never overwrites a newer one.
+struct CacheSidecars {
+    cache_path: PathBuf,
+    definition: String,
+    meta: parking_lot::Mutex<Option<CacheMetadata>>,
+    status_written: parking_lot::Mutex<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheMetadata {
+    definition: String,
+    payload_sha256: String,
+    updated_at: u64,
+    last_attempt_at: u64,
+    last_error: Option<String>,
+}
+
+impl CacheSidecars {
+    fn new(cache_path: PathBuf, definition: String) -> Self {
+        let meta = read_cache_metadata(&cache_path).filter(|m| m.definition == definition);
+        Self {
+            cache_path,
+            definition,
+            meta: parking_lot::Mutex::new(meta),
+            status_written: parking_lot::Mutex::new(0),
+        }
+    }
+
+    /// Record a payload that was just written to the cache.
+    fn record_payload(&self, bytes: &[u8], at: u64) {
+        let mut meta = self.meta.lock();
+        let fresh = CacheMetadata {
+            definition: self.definition.clone(),
+            payload_sha256: payload_digest(bytes),
+            updated_at: at,
+            last_attempt_at: at,
+            last_error: None,
+        };
+        write_sidecar(&sidecar_path(&self.cache_path, META_SUFFIX), &fresh);
+        *meta = Some(fresh);
+    }
+
+    /// Record a failed attempt against the cached payload, if there is one.
+    fn record_failure(&self, at: u64, error: &str) {
+        let mut meta = self.meta.lock();
+        if let Some(meta) = meta.as_mut() {
+            meta.last_attempt_at = at;
+            meta.last_error = Some(error.to_owned());
+            write_sidecar(&sidecar_path(&self.cache_path, META_SUFFIX), &*meta);
+        }
+    }
+
+    fn write_status(&self, seq: usize, status: &RuleProviderStatus) {
+        let mut written = self.status_written.lock();
+        if seq <= *written {
+            return;
+        }
+        write_sidecar(&sidecar_path(&self.cache_path, STATUS_SUFFIX), status);
+        *written = seq;
+    }
+}
+
+const META_SUFFIX: &str = ".meta.json";
+const STATUS_SUFFIX: &str = ".status.json";
+
+fn sidecar_path(cache_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = cache_path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn write_sidecar(path: &Path, value: &impl Serialize) {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => {
+            write_cache(path, &bytes);
+        }
+        Err(e) => warn!("rule-provider sidecar {}: {e}", path.display()),
+    }
+}
+
+fn read_cache_metadata(cache_path: &Path) -> Option<CacheMetadata> {
+    let bytes = std::fs::read(sidecar_path(cache_path, META_SUFFIX)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn payload_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The source identity a cache is bound to: the provider definition minus
+/// the fields that do not change what is fetched (`interval`, `path`).
+fn cache_definition(cfg: &RawRuleProvider) -> Result<String> {
+    let mut definition = serde_json::to_value(cfg)?;
+    if let Some(map) = definition.as_object_mut() {
+        map.remove("interval");
+        map.remove("path");
+        // An absent header map has the same source identity as its omission.
+        if map.get("header").is_some_and(serde_json::Value::is_null) {
+            map.remove("header");
+        }
+    }
+    Ok(serde_json::to_string(&definition)?)
+}
+
+/// `size-limit:` clamped to the internal HTTP body cap; absent or `0` is
+/// the cap itself.
+fn maximum_size(cfg: &RawRuleProvider) -> usize {
+    cfg.size_limit
+        .filter(|n| *n > 0)
+        .map_or(internal_http::MAX_BODY_BYTES, |n| {
+            n.min(internal_http::MAX_BODY_BYTES)
+        })
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
+fn truncate_error(error: &anyhow::Error) -> String {
+    format!("{error:#}").chars().take(MAX_ERROR_CHARS).collect()
 }
 
 /// What an http provider's load left for the background to fetch.
@@ -230,13 +415,27 @@ impl RuleProvider {
     /// (`self.ctx`): geo-dependent entries resolve against the same geo
     /// databases the initial load saw. Refresh callers therefore cannot
     /// accidentally pass a different (e.g. empty) context.
+    ///
+    /// Every attempt updates [`Self::status`] (and, for an http provider
+    /// with a cache, its `<cache>.status.json`).
     pub async fn refresh(&self) -> Result<()> {
+        if self.provider_type == ProviderType::Inline {
+            return Ok(());
+        }
+        self.mark_attempt().await;
+        let result = self.fetch_and_install().await;
+        self.record_outcome(&result).await;
+        result
+    }
+
+    async fn fetch_and_install(&self) -> Result<()> {
         let bytes = match self.provider_type {
             ProviderType::Http => {
-                fetch_http_async(
+                internal_http::fetch_capped(
                     &self.vehicle,
                     self.fetch.proxy.as_ref(),
                     &self.fetch.headers,
+                    self.maximum_size,
                 )
                 .await?
             }
@@ -245,6 +444,13 @@ impl RuleProvider {
                 .with_context(|| format!("reading provider file {}", self.vehicle))?,
             ProviderType::Inline => return Ok(()),
         };
+        if bytes.len() > self.maximum_size {
+            anyhow::bail!(
+                "provider payload of {} bytes exceeds its size limit of {} bytes",
+                bytes.len(),
+                self.maximum_size
+            );
+        }
         // Generation taken when the fetch completes: under the write lock
         // an older refresh that finishes after a newer one already wrote
         // skips its own write, so the file never regresses (issue #621).
@@ -267,7 +473,9 @@ impl RuleProvider {
         {
             return Ok(false);
         }
-        self.install_payload(bytes, 1).await.map(|()| true)
+        let result = self.install_payload(bytes, 1).await;
+        self.record_outcome(&result).await;
+        result.map(|()| true)
     }
 
     /// Parse fetched payload bytes on a blocking thread, persist them, and
@@ -279,6 +487,7 @@ impl RuleProvider {
         let format = self.format;
         let cache_path = self.cache_path.clone();
         let cache_write_lock = Arc::clone(&self.cache_write_lock);
+        let sidecars = self.sidecars.clone();
         let boxed: Box<dyn RuleSet> = crate::spawn_blocking_with_current_dispatcher(move || {
             let rules =
                 parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)?;
@@ -292,6 +501,9 @@ impl RuleProvider {
                 let mut written_gen = cache_write_lock.lock();
                 if *written_gen < gen && write_cache(path, &bytes) {
                     *written_gen = gen;
+                    if let Some(sidecars) = &sidecars {
+                        sidecars.record_payload(&bytes, unix_now());
+                    }
                 }
             }
             Ok::<Box<dyn RuleSet>, anyhow::Error>(rules)
@@ -332,6 +544,7 @@ impl RuleProvider {
         }
         *self.rules.write() = new_rules;
         *installed = gen;
+        self.loaded.store(true, Ordering::Relaxed);
         self.touch();
         debug!(provider = %self.name, "rule-provider refreshed: {} rules", count);
         Ok(())
@@ -362,6 +575,167 @@ impl RuleProvider {
         Some(tokio::spawn(initial_fetch_loop(Arc::downgrade(self), owed)))
     }
 
+    /// A snapshot of this provider's refresh state.
+    pub fn status(&self) -> RuleProviderStatus {
+        let updated_at = self.updated_at_secs();
+        let last_attempt = self.last_attempt_at_secs();
+        RuleProviderStatus {
+            name: self.name.clone(),
+            state: self.state_name(),
+            rule_count: self.rule_count(),
+            updated_at,
+            last_attempt_at: (last_attempt > 0).then_some(last_attempt),
+            next_update_at: (self.provider_type == ProviderType::Http && self.interval > 0)
+                .then(|| last_attempt.max(updated_at).saturating_add(self.interval)),
+            using_last_good: self.state.load(Ordering::Relaxed) == STATUS_FAILED
+                && self.loaded.load(Ordering::Relaxed),
+            last_error: self.last_error.read().clone(),
+        }
+    }
+
+    /// `ready`, `refreshing` or `failed`.
+    pub fn state_name(&self) -> &'static str {
+        match self.state.load(Ordering::Relaxed) {
+            STATUS_REFRESHING => "refreshing",
+            STATUS_FAILED => "failed",
+            _ => "ready",
+        }
+    }
+
+    /// Unix seconds of the last fetch attempt (`0`: none yet).
+    pub fn last_attempt_at_secs(&self) -> u64 {
+        #[allow(
+            clippy::useless_conversion,
+            reason = "identity on 64-bit; widens u32 on targets without 64-bit atomics"
+        )]
+        self.last_attempt_at.load(Ordering::Relaxed).into()
+    }
+
+    /// File name of the http provider's on-disk cache, if it has one.
+    pub fn cache_file_name(&self) -> Option<String> {
+        self.cache_path
+            .as_deref()?
+            .file_name()?
+            .to_str()
+            .map(str::to_owned)
+    }
+
+    /// The declared `format:` (`None` = auto-detected).
+    pub fn effective_format(&self) -> Option<RuleSetFormat> {
+        self.format
+    }
+
+    /// One page of the provider's source entries, with the total count:
+    /// the inline `payload:`, the file provider's file, or the http
+    /// provider's cache, re-read (blocking) and parsed as text/YAML. `None`
+    /// when there is no inspectable text representation — an MRS payload
+    /// (its compiled entries are not a stable user-facing form) or an http
+    /// provider without an on-disk cache.
+    pub fn preview_entries(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<(usize, Vec<String>)>> {
+        let page = |entries: &[String]| {
+            let page = entries.iter().skip(offset).take(limit).cloned().collect();
+            (entries.len(), page)
+        };
+        if let Some(entries) = self.inline_entries.as_deref() {
+            return Ok(Some(page(entries)));
+        }
+        let path = match self.provider_type {
+            ProviderType::File => PathBuf::from(&self.vehicle),
+            ProviderType::Http => match self.cache_path.clone() {
+                Some(path) => path,
+                None => return Ok(None),
+            },
+            ProviderType::Inline => return Ok(None),
+        };
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading provider contents {}", path.display()))?;
+        if bytes.len() > self.maximum_size {
+            anyhow::bail!("provider contents exceed the size limit");
+        }
+        if self.format == Some(RuleSetFormat::Mrs) || is_mrs_bytes(&bytes) {
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(&bytes).context("payload is not valid UTF-8")?;
+        let entries = match self.format.unwrap_or(RuleSetFormat::Yaml) {
+            RuleSetFormat::Yaml => parse_yaml_payload(text, false)?,
+            RuleSetFormat::Text => parse_text_payload(text),
+            RuleSetFormat::Mrs => return Ok(None),
+        };
+        Ok(Some(page(&entries)))
+    }
+
+    async fn mark_attempt(&self) {
+        self.last_attempt_at
+            .store(unix_now() as meow_common::atomic::Uint, Ordering::Relaxed);
+        self.state.store(STATUS_REFRESHING, Ordering::Relaxed);
+        self.persist_status_async().await;
+    }
+
+    /// Fold one attempt's outcome into the status (and its sidecars).
+    async fn record_outcome(&self, result: &Result<()>) {
+        match result {
+            Ok(()) => {
+                self.state.store(STATUS_READY, Ordering::Relaxed);
+                *self.last_error.write() = None;
+            }
+            Err(e) => {
+                let message = truncate_error(e);
+                self.state.store(STATUS_FAILED, Ordering::Relaxed);
+                *self.last_error.write() = Some(message.clone());
+                if let Some(sidecars) = self.sidecars.clone() {
+                    if !crate::is_offline_validate() {
+                        let at = self.last_attempt_at_secs();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            sidecars.record_failure(at, &message);
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+        self.persist_status_async().await;
+    }
+
+    /// Record a load that left the provider without a payload.
+    fn note_load_failure(&self, error: &anyhow::Error) {
+        self.last_attempt_at
+            .store(unix_now() as meow_common::atomic::Uint, Ordering::Relaxed);
+        // A download the deadline left running is still in progress.
+        if self.state.load(Ordering::Relaxed) != STATUS_REFRESHING {
+            self.state.store(STATUS_FAILED, Ordering::Relaxed);
+            *self.last_error.write() = Some(truncate_error(error));
+        }
+        self.persist_status();
+    }
+
+    /// Write `<cache>.status.json` synchronously (load path only).
+    fn persist_status(&self) {
+        let Some(sidecars) = self.sidecars.as_deref() else {
+            return;
+        };
+        if crate::is_offline_validate() {
+            return;
+        }
+        let seq = self.status_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        sidecars.write_status(seq, &self.status());
+    }
+
+    async fn persist_status_async(&self) {
+        let Some(sidecars) = self.sidecars.clone() else {
+            return;
+        };
+        if crate::is_offline_validate() {
+            return;
+        }
+        let seq = self.status_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let status = self.status();
+        let _ = tokio::task::spawn_blocking(move || sidecars.write_status(seq, &status)).await;
+    }
+
     fn owe(&self, owed: InitialFetch) {
         *self.initial_fetch.lock() = owed;
     }
@@ -388,6 +762,7 @@ impl RuleProvider {
     /// acquisition-then-parse load, or a refresh).
     fn swap_rules(&self, rules: Box<dyn RuleSet>) {
         *self.rules.write() = Arc::from(rules);
+        self.loaded.store(true, Ordering::Relaxed);
         self.touch();
     }
 }
@@ -494,9 +869,14 @@ enum Prefetched {
         persisted: AtomicBool,
     },
     /// An http provider's on-disk cache, read without a request.
+    /// `modified` is when it was fetched: its sidecar's timestamp, else the
+    /// file's mtime.
     Cached {
         bytes: Vec<u8>,
         modified: Option<SystemTime>,
+        /// The failed attempt its sidecar recorded after it was fetched.
+        last_attempt_at: u64,
+        last_error: Option<String>,
     },
     /// The download failed; the load pass reports it.
     Failed(String),
@@ -539,6 +919,7 @@ struct Download {
     url: String,
     proxy: Option<Arc<dyn Proxy>>,
     headers: Vec<(String, String)>,
+    limit: usize,
 }
 
 enum DownloadState {
@@ -620,7 +1001,13 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
                     let mut indexes = HashMap::with_capacity(count);
                     for (index, d) in downloads.into_iter().enumerate() {
                         let task = tasks.spawn(async move {
-                            internal_http::fetch(&d.url, d.proxy.as_ref(), &d.headers).await
+                            internal_http::fetch_capped(
+                                &d.url,
+                                d.proxy.as_ref(),
+                                &d.headers,
+                                d.limit,
+                            )
+                            .await
                         });
                         indexes.insert(task.id(), index);
                     }
@@ -773,7 +1160,7 @@ pub fn prefetch_payloads_within(
                 };
                 match http_source(name, cfg, cache_dir) {
                     Err(e) => Err(e),
-                    Ok((url, cache_path)) => match read_cache(cache_path.as_deref()) {
+                    Ok((url, cache_path)) => match read_cache(cache_path.as_deref(), cfg) {
                         Some(cached) => Ok(cached),
                         None if crate::is_offline_validate() => {
                             Ok(Prefetched::Failed(offline_miss(url)))
@@ -784,6 +1171,7 @@ pub fn prefetch_payloads_within(
                                 url: url.to_string(),
                                 proxy,
                                 headers: provider_headers(cfg),
+                                limit: maximum_size(cfg),
                             });
                             continue;
                         }
@@ -801,6 +1189,129 @@ pub fn prefetch_payloads_within(
     }
     out.entries.extend(download_all(downloads, deadline));
     out
+}
+
+/// Download and validate one http provider into `cache_dir` without a
+/// tunnel, a refresh task or a runtime registry — for an embedder that
+/// fetches providers while its runtime is down. The payload goes through
+/// the same capped transport, parser (strict) and cache publication
+/// (payload, `.meta.json`, `.status.json`) as a runtime load, so the next
+/// start serves it cache-first. A named download `proxy:` needs a running
+/// runtime and is rejected before any request, as is a `path:` escaping
+/// `cache_dir`.
+///
+/// On failure the cache is left untouched and `.status.json` records the
+/// failed attempt (`usingLastGood` when a usable cache remains).
+pub async fn download_http_provider(
+    name: String,
+    cfg: RawRuleProvider,
+    cache_dir: PathBuf,
+    geo: crate::GeoDataConfig,
+) -> Result<()> {
+    if cfg.provider_type != "http" {
+        return Err(anyhow!("only HTTP providers can be downloaded"));
+    }
+    effective_download_proxy(&cfg, None, &|_| None)?;
+    let cache_path = resolve_path(&cfg, Some(&cache_dir), &name, false)?
+        .ok_or_else(|| anyhow!("a provider cache path is required"))?;
+    let attempted_at = unix_now();
+    let result = async {
+        let url = cfg
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow!("an HTTP URL is required"))?;
+        let bytes =
+            internal_http::fetch_capped(url, None, &provider_headers(&cfg), maximum_size(&cfg))
+                .await?;
+        let (name, cfg, cache_dir) = (name.clone(), cfg.clone(), cache_dir.clone());
+        crate::spawn_blocking_with_current_dispatcher(move || {
+            let mut payloads = PrefetchedPayloads::new();
+            payloads.entries.insert(
+                name.clone(),
+                Prefetched::Downloaded {
+                    bytes,
+                    persisted: AtomicBool::new(false),
+                },
+            );
+            let raw = crate::raw::RawConfig {
+                rule_providers: Some(HashMap::from([(name.clone(), cfg.clone())])),
+                ..Default::default()
+            };
+            let ctx = crate::build_parser_context_with_geo(&raw, &geo, &payloads)?;
+            load_one(
+                &name,
+                &cfg,
+                Some(&cache_dir),
+                &ctx,
+                None,
+                payloads.entries.get(&name),
+                None,
+                true,
+            )
+            .map(drop)
+            .map_err(|e| anyhow!("{e}"))
+        })
+        .await
+        .map_err(|e| anyhow!("provider parse task failed: {e}"))?
+    }
+    .await;
+    if let Err(error) = &result {
+        let message = truncate_error(error);
+        tokio::task::spawn_blocking(move || {
+            record_download_failure(&name, &cfg, &cache_path, attempted_at, message);
+        })
+        .await
+        .map_err(|e| anyhow!("provider status task failed: {e}"))?;
+    }
+    result
+}
+
+/// [`download_http_provider`]'s failure bookkeeping: the cache stays, its
+/// sidecar and `.status.json` record the attempt.
+fn record_download_failure(
+    name: &str,
+    cfg: &RawRuleProvider,
+    cache_path: &Path,
+    attempted_at: u64,
+    message: String,
+) {
+    let cached = read_cache(Some(cache_path), cfg);
+    let status_path = sidecar_path(cache_path, STATUS_SUFFIX);
+    // The cache's rule count is what the last good status recorded.
+    let rule_count = cached
+        .as_ref()
+        .and_then(|_| std::fs::read(&status_path).ok())
+        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+        .and_then(|value| value.get("ruleCount")?.as_u64())
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    if let Ok(definition) = cache_definition(cfg) {
+        CacheSidecars::new(cache_path.to_path_buf(), definition)
+            .record_failure(attempted_at, &message);
+    }
+    let updated_at = match &cached {
+        Some(Prefetched::Cached {
+            modified: Some(modified),
+            ..
+        }) => modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs(),
+        _ => 0,
+    };
+    let status = RuleProviderStatus {
+        name: name.to_owned(),
+        state: "failed",
+        rule_count,
+        updated_at,
+        last_attempt_at: Some(attempted_at),
+        next_update_at: cfg
+            .interval
+            .filter(|interval| *interval > 0)
+            .map(|interval| attempted_at.max(updated_at).saturating_add(interval)),
+        using_last_good: cached.is_some(),
+        last_error: Some(message),
+    };
+    write_sidecar(&status_path, &status);
 }
 
 fn read_file_payload(
@@ -826,25 +1337,56 @@ fn http_source<'a>(
     Ok((url, resolve_path(cfg, cache_dir, name, false)?))
 }
 
-/// The on-disk cache of an http provider, if it has a readable one.
-fn read_cache(cache_path: Option<&Path>) -> Option<Prefetched> {
+/// The on-disk cache of an http provider, if it has a usable one: readable,
+/// within the provider's size limit, and — when it has a `.meta.json`
+/// sidecar — fetched for this provider definition with its bytes intact
+/// (see [`CacheSidecars`]).
+fn read_cache(cache_path: Option<&Path>, cfg: &RawRuleProvider) -> Option<Prefetched> {
     let path = cache_path?;
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            debug!("rule-provider cache hit: {}", path.display());
-            let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-            Some(Prefetched::Cached { bytes, modified })
+    let unusable = |why: &dyn std::fmt::Display| {
+        warn!(
+            "rule-provider cache {} is unusable ({why}), downloading instead",
+            path.display()
+        );
+        None
+    };
+    let file_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return unusable(&e),
+    };
+    let limit = maximum_size(cfg);
+    if file_meta.len() > limit as u64 {
+        return unusable(&format_args!("larger than its size limit of {limit} bytes"));
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return unusable(&e),
+    };
+    let sidecar = read_cache_metadata(path);
+    if let Some(meta) = &sidecar {
+        match cache_definition(cfg) {
+            Ok(definition) if definition == meta.definition => {}
+            _ => return unusable(&"fetched for a different provider definition"),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            warn!(
-                "rule-provider cache {} is unreadable, downloading instead: {}",
-                path.display(),
-                e
-            );
-            None
+        if meta.payload_sha256 != payload_digest(&bytes) {
+            return unusable(&"its payload does not match the recorded digest");
         }
     }
+    debug!("rule-provider cache hit: {}", path.display());
+    let modified = match &sidecar {
+        Some(meta) => Some(UNIX_EPOCH + Duration::from_secs(meta.updated_at)),
+        None => file_meta.modified().ok(),
+    };
+    let (last_attempt_at, last_error) = sidecar
+        .map(|meta| (meta.last_attempt_at, meta.last_error))
+        .unwrap_or_default();
+    Some(Prefetched::Cached {
+        bytes,
+        modified,
+        last_attempt_at,
+        last_error,
+    })
 }
 
 fn offline_miss(url: &str) -> String {
@@ -966,6 +1508,7 @@ pub fn load_providers_prefetched(
                 // later `PUT /providers/rules/{name}` refresh can heal it.
                 // Matches mihomo, which registers failed providers.
                 warn!("rule-provider '{name}': payload unavailable, starting empty: {e:#}");
+                provider.note_load_failure(&e);
                 out.insert(name.clone(), Arc::new(*provider));
             }
             Err(e) if strict => {
@@ -1121,7 +1664,7 @@ fn load_inline(
         ))
     })?;
     let rules = entries_to_rule_set(behavior, payload, ctx, strict)?;
-    Ok(make_provider(
+    let mut provider = make_provider(
         name,
         ProviderType::Inline,
         behavior,
@@ -1133,7 +1676,10 @@ fn load_inline(
         ctx.clone(),
         None,
         None,
-    ))
+    );
+    provider.loaded = AtomicBool::new(true);
+    provider.inline_entries = Some(Arc::from(payload));
+    Ok(provider)
 }
 
 fn load_file(
@@ -1166,7 +1712,7 @@ fn load_file(
     let explicit_format = parse_explicit_format(cfg).map_err(LoadError::Defect)?;
     // The provider object is constructed before acquisition so a read
     // failure can register it empty — a manual refresh re-reads the path.
-    let provider = make_provider(
+    let mut provider = make_provider(
         name,
         ProviderType::File,
         behavior,
@@ -1181,6 +1727,7 @@ fn load_file(
         // re-reads it; there is no separate cache to write.
         None,
     );
+    provider.maximum_size = maximum_size(cfg);
     let bytes_owned;
     let bytes: &[u8] = match prefetched {
         Some(b) => b,
@@ -1200,6 +1747,13 @@ fn load_file(
             }
         },
     };
+    if bytes.len() > provider.maximum_size {
+        return Err(LoadError::Payload(anyhow!(
+            "provider payload of {} bytes exceeds its size limit of {} bytes",
+            bytes.len(),
+            provider.maximum_size
+        )));
+    }
     let rules = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
         .map_err(LoadError::Payload)?;
     provider.swap_rules(rules);
@@ -1240,7 +1794,7 @@ fn load_http(
     // Constructed before acquisition: a fetch failure registers this
     // provider empty so `RULE-SET` references resolve, and the background
     // fetch the commit kicks off heals it (issue #533 review).
-    let provider = make_provider(
+    let mut provider = make_provider(
         name,
         ProviderType::Http,
         behavior,
@@ -1257,19 +1811,25 @@ fn load_http(
         explicit_format,
         cache_path.clone(),
     );
+    provider.maximum_size = maximum_size(cfg);
+    if let Some(path) = &cache_path {
+        let definition = cache_definition(cfg).map_err(LoadError::Defect)?;
+        provider.sidecars = Some(Arc::new(CacheSidecars::new(path.clone(), definition)));
+    }
+    // Nothing fetched yet: `updated_at` stays 0 until a payload installs.
+    provider.updated_at.store(0, Ordering::Relaxed);
     let acquired;
     let entry = match prefetched {
         Some(entry) => entry,
         None => {
-            let fetched = match read_cache(cache_path.as_deref()) {
+            let fetched = match read_cache(cache_path.as_deref(), cfg) {
                 Some(cached) => Ok(cached),
                 None if crate::is_offline_validate() => Err(anyhow!(offline_miss(url))),
-                None => fetch_http_blocking(url, download_proxy, &headers).map(|bytes| {
-                    Prefetched::Downloaded {
+                None => fetch_http_blocking(url, download_proxy, &headers, provider.maximum_size)
+                    .map(|bytes| Prefetched::Downloaded {
                         bytes,
                         persisted: AtomicBool::new(false),
-                    }
-                }),
+                    }),
             };
             match fetched {
                 Ok(entry) => {
@@ -1286,24 +1846,53 @@ fn load_http(
     let parse = |bytes: &[u8]| {
         parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
     };
+    if let Some(bytes) = entry.bytes() {
+        if bytes.len() > provider.maximum_size {
+            return Err(LoadError::Payload(anyhow!(
+                "provider payload of {} bytes exceeds its size limit of {} bytes",
+                bytes.len(),
+                provider.maximum_size
+            )));
+        }
+    }
     match entry {
         Prefetched::Fresh(bytes) => {
             provider.swap_rules(parse(bytes).map_err(LoadError::Payload)?);
         }
         Prefetched::Downloaded { bytes, persisted } => {
             provider.swap_rules(parse(bytes).map_err(LoadError::Payload)?);
+            provider
+                .last_attempt_at
+                .store(unix_now() as meow_common::atomic::Uint, Ordering::Relaxed);
             if let Some(path) = &cache_path {
-                if !persisted.swap(true, Ordering::Relaxed) {
-                    write_cache(path, bytes);
+                if !persisted.swap(true, Ordering::Relaxed) && write_cache(path, bytes) {
+                    if let Some(sidecars) = &provider.sidecars {
+                        sidecars.record_payload(bytes, provider.updated_at_secs());
+                    }
                 }
             }
         }
-        Prefetched::Cached { bytes, modified } => match parse(bytes) {
+        Prefetched::Cached {
+            bytes,
+            modified,
+            last_attempt_at,
+            last_error,
+        } => match parse(bytes) {
             Ok(rules) => {
                 provider.swap_rules(rules);
                 // Report the cache's age, not the load time.
                 if let Some(modified) = modified {
                     provider.set_updated_at(*modified);
+                }
+                provider.last_attempt_at.store(
+                    *last_attempt_at as meow_common::atomic::Uint,
+                    Ordering::Relaxed,
+                );
+                if let Some(error) = last_error {
+                    // The last refresh before the restart failed; the
+                    // cache is that failure's last-good payload.
+                    provider.state.store(STATUS_FAILED, Ordering::Relaxed);
+                    *provider.last_error.write() = Some(error.clone());
                 }
                 if cache_needs_revalidation(*modified, interval) {
                     provider.owe(InitialFetch::Revalidate);
@@ -1329,6 +1918,7 @@ fn load_http(
             return Err(LoadError::Acquisition(Box::new(provider), anyhow!("{e}")));
         }
         Prefetched::Pending(pending) => {
+            provider.state.store(STATUS_REFRESHING, Ordering::Relaxed);
             provider.owe(InitialFetch::Adopt(pending.clone()));
             return Err(LoadError::Acquisition(
                 Box::new(provider),
@@ -1336,6 +1926,7 @@ fn load_http(
             ));
         }
     }
+    provider.persist_status();
     Ok(provider)
 }
 
@@ -1380,6 +1971,14 @@ fn make_provider(
         // `written_gen` of 0 under `cache_write_lock`.
         refresh_gen: meow_common::atomic::AtomicU::new(1),
         initial_fetch: parking_lot::Mutex::new(InitialFetch::Settled),
+        maximum_size: internal_http::MAX_BODY_BYTES,
+        sidecars: None,
+        last_attempt_at: AtomicU::new(0),
+        state: AtomicU8::new(STATUS_READY),
+        last_error: RwLock::new(None),
+        loaded: AtomicBool::new(false),
+        status_seq: AtomicUsize::new(0),
+        inline_entries: None,
     }
 }
 
@@ -1593,6 +2192,7 @@ fn fetch_http_blocking(
     url: &str,
     proxy: Option<&Arc<dyn Proxy>>,
     headers: &[(String, String)],
+    limit: usize,
 ) -> Result<Vec<u8>> {
     let url = url.to_string();
     let thread_url = url.clone();
@@ -1603,7 +2203,12 @@ fn fetch_http_blocking(
             .enable_all()
             .build()
             .context("building temporary tokio runtime for rule-provider fetch")?;
-        rt.block_on(fetch_http_async(&thread_url, proxy.as_ref(), &headers))
+        rt.block_on(internal_http::fetch_capped(
+            &thread_url,
+            proxy.as_ref(),
+            &headers,
+            limit,
+        ))
     })
     .join()
     .map_err(|payload| {
@@ -1625,6 +2230,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_http_async(
     url: &str,
     proxy: Option<&Arc<dyn Proxy>>,
@@ -1691,6 +2297,7 @@ mod tests {
 
     fn http_cfg(proxy: Option<&str>) -> RawRuleProvider {
         RawRuleProvider {
+            size_limit: None,
             provider_type: "http".to_string(),
             behavior: "domain".to_string(),
             format: Some("yaml".to_string()),
@@ -1786,6 +2393,7 @@ mod tests {
         providers.insert(
             "f".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "file".to_string(),
                 behavior: "domain".to_string(),
                 format: Some("yaml".to_string()),
@@ -1811,6 +2419,7 @@ mod tests {
         providers.insert(
             "test".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "file".to_string(),
                 behavior: "domain".to_string(),
                 format: Some("yaml".to_string()),
@@ -1836,6 +2445,7 @@ mod tests {
         providers.insert(
             "my-rules".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "inline".to_string(),
                 behavior: "domain".to_string(),
                 format: None,
@@ -1857,6 +2467,7 @@ mod tests {
     #[test]
     fn inline_with_interval_hard_errors() {
         let cfg = RawRuleProvider {
+            size_limit: None,
             provider_type: "inline".to_string(),
             behavior: "domain".to_string(),
             format: None,
@@ -1886,6 +2497,7 @@ mod tests {
         providers.insert(
             "mrs-test".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "file".to_string(),
                 behavior: "domain".to_string(),
                 format: None,
@@ -1913,6 +2525,7 @@ mod tests {
         providers.insert(
             "x".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "file".to_string(),
                 behavior: "domain".to_string(),
                 format: Some("mrs".to_string()),
@@ -1935,6 +2548,7 @@ mod tests {
         providers.insert(
             "nope".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "file".to_string(),
                 behavior: "domain".to_string(),
                 format: None,
@@ -1959,6 +2573,7 @@ mod tests {
         providers.insert(
             "warn-test".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "file".to_string(),
                 behavior: "domain".to_string(),
                 format: Some("yaml".to_string()),
@@ -2016,6 +2631,7 @@ mod tests {
         providers.insert(
             "http-test".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "http".to_string(),
                 behavior: "domain".to_string(),
                 format: Some("yaml".to_string()),
@@ -2128,6 +2744,7 @@ header:
         providers.insert(
             "hdr-test".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "http".to_string(),
                 behavior: "domain".to_string(),
                 format: Some("yaml".to_string()),
@@ -2206,6 +2823,7 @@ header:
         providers.insert(
             "hdr-single-test".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "http".to_string(),
                 behavior: "domain".to_string(),
                 format: Some("yaml".to_string()),
@@ -2242,6 +2860,7 @@ header:
         providers.insert(
             "p1".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "inline".to_string(),
                 behavior: "domain".to_string(),
                 format: None,
@@ -2256,6 +2875,7 @@ header:
         providers.insert(
             "p2".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "inline".to_string(),
                 behavior: "ipcidr".to_string(),
                 format: None,
@@ -2339,6 +2959,7 @@ header:
         providers.insert(
             "live".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 url: Some(format!("http://{addr}/rules.yaml")),
                 ..http_cfg(None)
             },
@@ -2405,6 +3026,7 @@ header:
         providers.insert(
             "live".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 url: Some(format!("http://{addr}/rules.yaml")),
                 ..http_cfg(None)
             },
@@ -2488,6 +3110,7 @@ header:
     #[test]
     fn stray_path_on_inline_provider_is_ignored() {
         let inline_cfg = |path: &str| RawRuleProvider {
+            size_limit: None,
             provider_type: "inline".to_string(),
             behavior: "domain".to_string(),
             format: None,
@@ -2586,7 +3209,7 @@ header:
     /// `internal_http::response_bytes_with_limit`. The unit tests on
     /// `response_bytes_capped` cover the cap logic itself; here a local
     /// server declares a `Content-Length` above `MAX_BODY_BYTES` (so nothing
-    /// close to 256 MiB is actually transferred) and the fetch must fail
+    /// close to 20 MiB is actually transferred) and the fetch must fail
     /// with the cap error before buffering the body.
     #[tokio::test]
     async fn fetch_http_async_rejects_oversized_response_end_to_end() {
@@ -2635,6 +3258,7 @@ header:
         providers.insert(
             "geo-file".to_string(),
             RawRuleProvider {
+                size_limit: None,
                 provider_type: "file".to_string(),
                 behavior: "classical".to_string(),
                 format: Some("text".to_string()),
@@ -2682,6 +3306,7 @@ header:
 
     fn http_provider(url: &str, interval: u64) -> RawRuleProvider {
         RawRuleProvider {
+            size_limit: None,
             url: Some(url.to_string()),
             interval: (interval > 0).then_some(interval),
             ..http_cfg(None)

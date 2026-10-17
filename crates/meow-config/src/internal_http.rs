@@ -13,7 +13,7 @@
 //!   * HTTP/1.1, `Connection: close`, `Accept-Encoding: identity`.
 //!   * Follows up to 5 redirects (`3xx` with `Location`).
 //!   * No streaming — full body buffered in memory, capped at
-//!     `MAX_BODY_BYTES` (256 MiB).
+//!     `MAX_BODY_BYTES` (20 MiB).
 
 use anyhow::{anyhow, bail, Result};
 use meow_common::adapter::Proxy;
@@ -37,7 +37,7 @@ const MAX_REDIRECTS: u8 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const USER_AGENT: &str = concat!("clash.meta/", env!("CARGO_PKG_VERSION"));
-pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB hard ceiling
+pub(crate) const MAX_BODY_BYTES: usize = 20 * 1024 * 1024; // 20 MiB hard ceiling
 /// Headroom on top of the body cap for the status line + headers.
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 
@@ -161,7 +161,7 @@ pub async fn fetch(
 
 /// [`fetch`] with the body cap as a parameter, so tests can exercise the
 /// oversize paths without transferring hundreds of megabytes.
-async fn fetch_capped(
+pub(crate) async fn fetch_capped(
     url: &str,
     proxy: Option<&Arc<dyn Proxy>>,
     headers: &[(String, String)],

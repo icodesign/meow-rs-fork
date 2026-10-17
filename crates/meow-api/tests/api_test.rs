@@ -5253,6 +5253,92 @@ async fn put_configs_publishes_rule_provider_registry_changes() {
     );
 }
 
+/// `GET /providers/rules/{name}` reports refresh status, and
+/// `GET /providers/rules/{name}/contents` pages through the source entries.
+#[tokio::test]
+async fn rule_provider_status_and_contents_paging() {
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let yaml = concat!(
+        "mode: rule\n",
+        "rule-providers:\n",
+        "  doms:\n",
+        "    type: inline\n",
+        "    behavior: domain\n",
+        "    payload:\n",
+        "      - 'a.example'\n",
+        "      - 'b.example'\n",
+        "      - 'c.example'\n",
+        "rules:\n",
+        "  - RULE-SET,doms,REJECT\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "payload": payload }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let get = |uri: &'static str| {
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+    };
+    let json = |resp: axum::response::Response| async move {
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+    };
+
+    let info = json(get("/providers/rules/doms").await.unwrap()).await;
+    assert_eq!(info["state"], "ready", "{info}");
+    assert_eq!(info["ruleCount"], 3, "{info}");
+    assert_eq!(info["interval"], 0, "{info}");
+    assert_eq!(info["usingLastGood"], false, "{info}");
+    assert!(info["cacheFileName"].is_null(), "{info}");
+    assert!(info["lastError"].is_null(), "{info}");
+    assert!(info["nextUpdateAt"].is_null(), "{info}");
+
+    let page = json(
+        get("/providers/rules/doms/contents?offset=1&limit=1")
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(page["available"], true, "{page}");
+    assert_eq!(page["total"], 3, "{page}");
+    assert_eq!(page["offset"], 1, "{page}");
+    assert_eq!(page["limit"], 1, "{page}");
+    assert_eq!(page["rules"], serde_json::json!(["b.example"]), "{page}");
+
+    // `limit` is clamped to at least one entry.
+    let page = json(get("/providers/rules/doms/contents?limit=0").await.unwrap()).await;
+    assert_eq!(page["rules"], serde_json::json!(["a.example"]), "{page}");
+
+    assert_eq!(
+        get("/providers/rules/missing/contents")
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
 /// Issue #543 — one `PUT /configs` commit must fetch each rule-provider
 /// payload exactly once: the routing rebuild's prefetched bytes are shared
 /// with the DNS rebuild instead of being fetched a second time inside

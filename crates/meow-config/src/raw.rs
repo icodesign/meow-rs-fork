@@ -549,6 +549,11 @@ pub struct RawHealthCheck {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawRuleProvider {
+    /// Per-provider download/payload size cap in bytes (`size-limit:`).
+    /// Absent or `0` = the internal HTTP body cap; larger values are
+    /// clamped to it.
+    #[serde(default)]
+    pub size_limit: Option<usize>,
     #[serde(rename = "type")]
     pub provider_type: String, // "http" | "file" | "inline"
     pub behavior: String,       // "domain" | "ipcidr" | "classical"
