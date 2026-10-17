@@ -11,6 +11,24 @@ homepage.workspace = true
 [features]
 default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
 ss = ["dep:shadowsocks", "meow-transport/simple-obfs", "meow-transport/shadow-tls", "meow-transport/restls", "meow-transport/jls"]
+# ShadowsocksR outbound (`type: ssr`). Opt-in: TCP uses the native SSR
+# protocol/obfs codec in `src/ssr/`; UDP reuses the `ss` adapter.
+ssr = [
+    "ss",
+    "dep:aes",
+    "dep:blowfish",
+    "dep:cbc",
+    "dep:cfb-mode",
+    "dep:chacha20",
+    "dep:cipher",
+    "dep:crc32fast",
+    "dep:hmac",
+    "dep:md-5",
+    "dep:pin-project-lite",
+    "dep:salsa20",
+    "dep:sha1",
+    "dep:shadowsocks-crypto",
+]
 trojan = []
 vless = []
 vmess = ["dep:md-5", "dep:hmac", "dep:aes", "dep:boring", "dep:crc32fast"]
@@ -89,6 +107,16 @@ boring = { workspace = true, optional = true }
 webpki-root-certs = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
 shadowsocks = { workspace = true, optional = true }
+# SSR legacy stream ciphers + protocol/obfs codecs (`ssr` feature only).
+blowfish = { version = "0.9.1", optional = true }
+cbc = { version = "0.1", optional = true }
+cfb-mode = { version = "0.8.2", optional = true }
+chacha20 = { version = "0.9", optional = true }
+cipher = { version = "0.4", optional = true }
+pin-project-lite = { version = "0.2", optional = true }
+salsa20 = { version = "0.10", optional = true }
+sha1 = { workspace = true, optional = true }
+shadowsocks-crypto = { version = "0.6.2", features = ["v1-stream"], optional = true }
 argon2 = { workspace = true, optional = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

@@ -5,6 +5,8 @@ use meow_common::{
 };
 #[cfg(feature = "ss")]
 use meow_proxy::ShadowsocksAdapter;
+#[cfg(feature = "ssr")]
+use meow_proxy::ShadowsocksRAdapter;
 #[cfg(feature = "trojan")]
 use meow_proxy::TrojanAdapter;
 use meow_proxy::{
@@ -281,6 +283,11 @@ pub fn parse_proxy_with_dialer(
             parse_mux_options(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
+        #[cfg(feature = "ssr")]
+        "ssr" | "shadowsocksr" => {
+            let adapter = parse_shadowsocksr(name, config, dialer)?;
+            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+        }
         #[cfg(feature = "trojan")]
         "trojan" => {
             let server = config
@@ -374,6 +381,8 @@ pub fn parse_proxy_with_dialer(
         "trusttunnel" => Err(feature_gated_proxy_type("trusttunnel")),
         #[cfg(not(feature = "ss"))]
         "ss" => Err(feature_gated_proxy_type("ss")),
+        #[cfg(not(feature = "ssr"))]
+        "ssr" | "shadowsocksr" => Err(feature_gated_proxy_type("ssr")),
         #[cfg(not(feature = "trojan"))]
         "trojan" => Err(feature_gated_proxy_type("trojan")),
         #[cfg(not(feature = "vless"))]
@@ -449,6 +458,7 @@ fn reject_unthreaded_dialer(
 /// use a full-featured build (issue #390).
 #[cfg(not(all(
     feature = "ss",
+    feature = "ssr",
     feature = "trojan",
     feature = "vless",
     feature = "anytls",
@@ -461,11 +471,80 @@ fn feature_gated_proxy_type(proxy_type: &str) -> String {
     if proxy_type == "trusttunnel" {
         return "proxy type 'trusttunnel' is not compiled into this build; rebuild with `--features trusttunnel` (the protocol is opt-in and excluded from full)".into();
     }
+    if proxy_type == "ssr" {
+        return "proxy type 'ssr' is not compiled into this build; rebuild meow-config / meow-proxy with `--features ssr` (the protocol is opt-in and excluded from full)".into();
+    }
     format!(
         "proxy type '{proxy_type}' is not compiled into this build; \
          use an official release binary or rebuild with `--features full` \
          (or `--features {proxy_type}`)"
     )
+}
+
+/// Parse a `type: ssr` / `type: shadowsocksr` proxy block into a
+/// `ShadowsocksRAdapter`.
+///
+/// Mihomo-compatible keys: `server`, `port`, `password`, `cipher`, `udp`,
+/// `protocol` (default `origin`), `protocol-param`, `obfs` (default
+/// `plain`), `obfs-param`. The adapter owns the protocol and obfuscation
+/// wire codec inside `meow-proxy`.
+/// upstream: mihomo adapter/outbound/shadowsocksr.go
+#[cfg(feature = "ssr")]
+fn parse_shadowsocksr(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+) -> std::result::Result<ShadowsocksRAdapter, String> {
+    let server = config
+        .get("server")
+        .and_then(|v| v.as_str())
+        .ok_or("ssr: missing server")?;
+    let port = required_port(config, "ssr")?;
+    let password = config
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or("ssr: missing password")?;
+    let cipher = config
+        .get("cipher")
+        .and_then(|v| v.as_str())
+        .ok_or("ssr: missing cipher")?;
+    let udp = config
+        .get("udp")
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false);
+    let protocol = config
+        .get("protocol")
+        .and_then(|v| v.as_str())
+        .unwrap_or("origin");
+    let protocol_param = config.get("protocol-param").and_then(nullable_string);
+    let obfs = config
+        .get("obfs")
+        .and_then(|v| v.as_str())
+        .unwrap_or("plain");
+    let obfs_param = config.get("obfs-param").and_then(nullable_string);
+
+    ShadowsocksRAdapter::new(
+        name,
+        server,
+        port,
+        password,
+        cipher,
+        udp,
+        protocol,
+        protocol_param,
+        obfs,
+        obfs_param,
+        Arc::clone(dialer),
+    )
+    .map_err(|e| format!("ssr: {e}"))
+}
+
+#[cfg(feature = "ssr")]
+fn nullable_string(value: &serde_yaml::Value) -> Option<&str> {
+    match value {
+        serde_yaml::Value::Null => None,
+        other => other.as_str(),
+    }
 }
 
 /// Parse a `type: snell` proxy block.
@@ -3573,6 +3652,44 @@ mod tests {
             panic!("zero port must hard-error");
         };
         assert!(err.contains("port must be non-zero"), "msg: {err}");
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn parses_ssr_with_native_meow_codec() {
+        let cfg = proxy_config(
+            "name: ssr-native\ntype: shadowsocksr\nserver: 127.0.0.1\nport: 8388\npassword: secret\ncipher: aes-128-cfb\nprotocol: auth_aes128_sha1\nprotocol-param: 100:token\nobfs: tls1.2_ticket_auth\nobfs-param: example.com\nudp: true\n",
+        );
+
+        let proxy = parse_proxy(&cfg).expect("native SSR proxy must parse");
+
+        assert_eq!(proxy.name(), "ssr-native");
+        assert_eq!(proxy.adapter_type(), AdapterType::ShadowsocksR);
+        assert!(proxy.support_udp());
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn ssr_rejects_unknown_protocol() {
+        let cfg = proxy_config(
+            "name: ssr-bad\ntype: ssr\nserver: 127.0.0.1\nport: 8388\npassword: secret\ncipher: aes-128-cfb\nprotocol: nope\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("unknown SSR protocol must hard-error");
+        };
+        assert!(err.contains("unknown ssr protocol"), "msg: {err}");
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    #[test]
+    fn ssr_without_feature_is_feature_gated() {
+        let cfg = proxy_config(
+            "name: ssr\ntype: ssr\nserver: 127.0.0.1\nport: 8388\npassword: secret\ncipher: aes-128-cfb\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("ssr must be rejected without the `ssr` feature");
+        };
+        assert!(err.contains("--features ssr"), "msg: {err}");
     }
 
     #[cfg(feature = "ss")]

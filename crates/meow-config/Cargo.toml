@@ -11,6 +11,7 @@ homepage.workspace = true
 [features]
 default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun"]
 ss = ["meow-proxy/ss"]
+ssr = ["ss", "meow-proxy/ssr"]
 trojan = ["meow-proxy/trojan"]
 # `meow-transport/reality` rides along with vless: `reality-opts` is only
 # reachable from the vless parser, and REALITY must not depend on boring-tls

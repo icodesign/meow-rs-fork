@@ -40,6 +40,10 @@ pub mod restls_plugin;
 pub mod shadow_tls_plugin;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;
+#[cfg(feature = "ssr")]
+pub mod shadowsocksr_adapter;
+#[cfg(feature = "ssr")]
+mod ssr;
 #[cfg(feature = "ss")]
 pub mod v2ray_plugin;
 
@@ -88,6 +92,8 @@ pub use http_adapter::HttpAdapter;
 pub use reject::RejectAdapter;
 #[cfg(feature = "ss")]
 pub use shadowsocks_adapter::ShadowsocksAdapter;
+#[cfg(feature = "ssr")]
+pub use shadowsocksr_adapter::ShadowsocksRAdapter;
 pub use socks5_adapter::Socks5Adapter;
 pub use stream_conn::StreamConn;
 pub use transport_chain::TransportChain;
