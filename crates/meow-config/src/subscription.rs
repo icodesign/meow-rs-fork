@@ -5,6 +5,10 @@ use std::sync::Arc;
 
 /// Result of parsing a subscription YAML.
 pub struct SubscriptionData {
+    /// The merge-expanded YAML root, retained for consumers that must preserve
+    /// rule providers and other product-owned subscription fields instead of
+    /// reducing the response to proxies/groups/rules only.
+    pub document: Value,
     pub proxies: Vec<HashMap<String, Value>>,
     pub proxy_groups: Vec<RawProxyGroup>,
     pub rules: Vec<String>,
@@ -453,6 +457,7 @@ pub fn parse_subscription_yaml(
     }
 
     Ok(SubscriptionData {
+        document: root,
         proxies,
         proxy_groups,
         rules,
@@ -518,6 +523,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: vec![proxy_entry("node-1")],
                 proxy_groups: Vec::new(),
                 rules: Vec::new(),
@@ -556,6 +562,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: vec![proxy_entry("node-1")],
                 proxy_groups: Vec::new(),
                 rules: Vec::new(),
@@ -569,6 +576,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: vec![proxy_entry("node-2")],
                 proxy_groups: Vec::new(),
                 rules: Vec::new(),
@@ -599,6 +607,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: Vec::new(),
                 proxy_groups: Vec::new(),
                 rules: vec!["DOMAIN,sub.example,node-1".into(), "MATCH,node-1".into()],
@@ -620,6 +629,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: Vec::new(),
                 proxy_groups: Vec::new(),
                 rules: Vec::new(),
@@ -646,6 +656,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: Vec::new(),
                 proxy_groups: Vec::new(),
                 rules: vec!["MATCH,DIRECT".into()],
@@ -661,6 +672,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: Vec::new(),
                 proxy_groups: Vec::new(),
                 rules: Vec::new(),
@@ -685,6 +697,7 @@ mod tests {
             &mut raw,
             "a",
             SubscriptionData {
+                document: Value::Null,
                 proxies: vec![proxy_entry("shared")],
                 proxy_groups: Vec::new(),
                 rules: Vec::new(),
@@ -695,6 +708,7 @@ mod tests {
             &mut raw,
             "b",
             SubscriptionData {
+                document: Value::Null,
                 proxies: vec![proxy_entry("shared"), proxy_entry("b-only")],
                 proxy_groups: Vec::new(),
                 rules: Vec::new(),
@@ -735,6 +749,7 @@ mod tests {
         let mut raw = raw_with_sub(sub("a"));
         raw.subscriptions.as_mut().unwrap().push(sub("b"));
         let payload = || SubscriptionData {
+            document: Value::Null,
             proxies: Vec::new(),
             proxy_groups: Vec::new(),
             rules: vec!["DOMAIN,x.test,REJECT".into()],
@@ -805,6 +820,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: vec![proxy_entry("n1")],
                 proxy_groups: vec![RawProxyGroup {
                     name: "g1".into(),
@@ -858,6 +874,7 @@ mod tests {
             &mut raw,
             "s",
             SubscriptionData {
+                document: Value::Null,
                 proxies: vec![proxy_entry("node-1")],
                 proxy_groups: vec![group("g")],
                 rules: vec!["MATCH,g".into()],
