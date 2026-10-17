@@ -111,6 +111,15 @@ impl DnsServer {
         self.bind().await?.run().await
     }
 
+    /// Diagnostic question metadata, using the server's canonical wire parser.
+    /// This does not resolve a name or change how the query is answered.
+    pub fn describe_query(data: &[u8]) -> Option<(String, u16)> {
+        let question = data.get(12..)?;
+        Self::parse_question(question)
+            .ok()
+            .map(|(domain, kind, _)| (domain, kind))
+    }
+
     pub async fn handle_query(
         data: &[u8],
         resolver: &Resolver,
