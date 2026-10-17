@@ -107,9 +107,12 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Linux `SO_MARK`, …) before returning the socket so DNS traffic bypasses
 /// the local VPN tunnel.
 pub trait SocketFactory: Send + Sync + 'static {
-    /// Bind an unconnected UDP socket. Implementations typically bind to
-    /// `0.0.0.0:0`.
-    fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>>;
+    /// Bind an unconnected UDP socket compatible with `remote_addr`.
+    ///
+    /// Implementations must preserve the remote address family: an IPv6
+    /// upstream requires an IPv6 local socket and cannot be reached from a
+    /// socket bound to `0.0.0.0:0`.
+    fn bind_udp(&self, remote_addr: SocketAddr) -> BoxFuture<'_, io::Result<UdpSocket>>;
 
     /// Open an outbound TCP connection to `addr`.
     fn connect_tcp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>>;
@@ -121,13 +124,8 @@ pub trait SocketFactory: Send + Sync + 'static {
 struct DefaultSocketFactory;
 
 impl SocketFactory for DefaultSocketFactory {
-    fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>> {
-        Box::pin(async {
-            // Bind to v4 unspecified; this is fine because we always
-            // `connect()` the socket before sending, and connect() will
-            // re-resolve the local address family.
-            meow_common::bind_udp(SocketAddr::from(([0u8; 4], 0))).await
-        })
+    fn bind_udp(&self, remote_addr: SocketAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
+        Box::pin(async move { meow_common::bind_udp(udp_bind_addr(remote_addr.is_ipv6())).await })
     }
 
     fn connect_tcp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>> {
@@ -1228,7 +1226,7 @@ async fn udp_exchange(
         };
         UdpSocket::bind(local).await?
     } else {
-        factory().bind_udp().await?
+        factory().bind_udp(addr).await?
     };
     sock.connect(addr).await?;
     sock.send(wire).await?;
@@ -1249,6 +1247,20 @@ async fn udp_exchange(
             return tcp_message_exchange(&mut stream, wire, expected).await;
         }
         return Ok(response);
+    }
+}
+
+/// Local wildcard bind address for an upstream of the given address family.
+///
+/// A socket's address family is fixed at creation, so `connect()` to an
+/// upstream of the other family fails with `EINVAL` — in both directions.
+/// Binding the matching family is therefore the only workable choice; a
+/// "just always bind v6" shortcut would break IPv4 upstreams instead.
+fn udp_bind_addr(is_ipv6: bool) -> SocketAddr {
+    if is_ipv6 {
+        SocketAddr::from(([0u16; 8], 0))
+    } else {
+        SocketAddr::from(([0u8; 4], 0))
     }
 }
 
@@ -2664,5 +2676,56 @@ mod tests {
         )
         .unwrap();
         assert!(r.ips.is_empty());
+    }
+
+    #[test]
+    fn udp_socket_bind_address_matches_upstream_address_family() {
+        assert!(udp_bind_addr(false).is_ipv4());
+        assert!(udp_bind_addr(true).is_ipv6());
+        assert_eq!(udp_bind_addr(false).port(), 0);
+        assert_eq!(udp_bind_addr(true).port(), 0);
+        assert!(udp_bind_addr(false).ip().is_unspecified());
+        assert!(udp_bind_addr(true).ip().is_unspecified());
+    }
+
+    /// Pins the OS behaviour `udp_bind_addr` exists for: a UDP socket's address
+    /// family is fixed at creation, so `connect()` to an upstream of the other
+    /// family fails — in *both* directions. The v6→v4 half is what rules out
+    /// collapsing this to a single "always bind `[::]:0`" socket.
+    ///
+    /// `connect()` on UDP sends no packets, so this needs no connectivity. The
+    /// addresses are RFC 5737 / RFC 3849 documentation ranges.
+    #[tokio::test]
+    async fn udp_connect_rejects_a_mismatched_upstream_address_family() {
+        // Both directions need an IPv6 socket; a host without IPv6 support
+        // (some containers) cannot exercise this at all.
+        if UdpSocket::bind(udp_bind_addr(true)).await.is_err() {
+            eprintln!("skipping: this host cannot create IPv6 UDP sockets");
+            return;
+        }
+        let ipv4_upstream: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let ipv6_upstream: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+
+        for (upstream, label) in [(ipv4_upstream, "ipv4"), (ipv6_upstream, "ipv6")] {
+            let matched = UdpSocket::bind(udp_bind_addr(upstream.is_ipv6()))
+                .await
+                .expect("binding the upstream's own family must succeed");
+            matched.connect(upstream).await.unwrap_or_else(|error| {
+                panic!("{label} upstream must be reachable from its own family: {error}")
+            });
+
+            let mismatched = UdpSocket::bind(udp_bind_addr(!upstream.is_ipv6()))
+                .await
+                .expect("binding the opposite family must succeed");
+            let error = mismatched
+                .connect(upstream)
+                .await
+                .expect_err("connect() must reject an upstream of the other address family");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidInput,
+                "{label} upstream from the opposite family: unexpected error {error}"
+            );
+        }
     }
 }
