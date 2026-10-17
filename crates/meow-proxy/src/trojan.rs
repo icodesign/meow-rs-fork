@@ -1,6 +1,8 @@
 //! Trojan outbound proxy adapter.
 //!
 //! TLS is provided by `meow_transport::tls::TlsLayer` (M1.A-1 migration).
+//! An optional stream transport (ws / grpc / h2) rides on top of TLS via
+//! [`TrojanAdapter::with_transport`], matching mihomo's trojan `network`.
 //! Protocol logic — SHA-224 password hash, CRLF header, SOCKS5 address
 //! encoding — remains here unchanged.
 //!
@@ -15,7 +17,7 @@ use meow_common::{
 };
 use meow_transport::{
     tls::{TlsConfig, TlsLayer},
-    Stream as TransportStream, Transport,
+    Stream as TransportStream,
 };
 use sha2::{Digest, Sha224};
 use smol_str::SmolStr;
@@ -27,7 +29,7 @@ use tracing::debug;
 #[cfg(feature = "mux")]
 use crate::mux::{MuxClient, MuxOptions};
 use crate::stream_conn::StreamConn;
-use crate::transport_to_proxy_err;
+use crate::transport_chain::TransportChain;
 use std::sync::Arc;
 
 /// SOCKS5-style command bytes used inside the Trojan request header.
@@ -49,7 +51,8 @@ pub struct TrojanAdapter {
     hex_password: SmolStr,
     support_udp: bool,
     health: ProxyHealth,
-    tls_layer: Arc<TlsLayer>,
+    /// TLS, then the optional `network` transport (ws / grpc / h2).
+    transport: Arc<TransportChain>,
     /// Pluggable TCP dialer for the underlying connection to the proxy
     /// server (direct or via dialer-proxy).
     dialer: Arc<dyn crate::dialer::TcpDialer>,
@@ -92,6 +95,8 @@ impl TrojanAdapter {
 
         let tls_layer = TlsLayer::new(&tls_config)
             .expect("TrojanAdapter: failed to build TlsLayer — check SNI/cert config");
+        let mut transport = TransportChain::empty();
+        transport.push(Box::new(tls_layer));
 
         Self {
             name: SmolStr::from(name),
@@ -102,10 +107,21 @@ impl TrojanAdapter {
             dialer,
             support_udp: udp,
             health: ProxyHealth::new(),
-            tls_layer: Arc::new(tls_layer),
+            transport: Arc::new(transport),
             #[cfg(feature = "mux")]
             mux: None,
         }
+    }
+
+    /// Replace the default TLS-only chain with `transport`, which must start
+    /// with the TLS layer (Trojan always runs inside TLS) and may append a
+    /// stream transport such as ws / grpc / h2.  Call before
+    /// [`Self::with_mux`], whose dialer captures the chain.
+    pub fn with_transport(mut self, transport: TransportChain) -> Self {
+        #[cfg(feature = "mux")]
+        debug_assert!(self.mux.is_none(), "with_transport must precede with_mux");
+        self.transport = Arc::new(transport);
+        self
     }
 
     /// Enable sing-mux compatible connection multiplexing.  The Trojan
@@ -119,13 +135,13 @@ impl TrojanAdapter {
         let server = self.server.clone();
         let port = self.port;
         let hex_password = self.hex_password.clone();
-        let tls_layer = Arc::clone(&self.tls_layer);
+        let transport = Arc::clone(&self.transport);
         let dialer = Arc::clone(&self.dialer);
 
         let dial: crate::mux::DialFn = Arc::new(move || {
             let server = server.clone();
             let hex_password = hex_password.clone();
-            let tls_layer = Arc::clone(&tls_layer);
+            let transport = Arc::clone(&transport);
             let dialer = Arc::clone(&dialer);
             Box::pin(async move {
                 // Build the mux-destination request header.
@@ -158,10 +174,7 @@ impl TrojanAdapter {
                     .dial(&server, port, false)
                     .await
                     .map_err(MeowError::Io)?;
-                let mut stream = tls_layer
-                    .connect(tcp)
-                    .await
-                    .map_err(transport_to_proxy_err)?;
+                let mut stream = transport.connect(tcp).await?;
                 stream.write_all(header).await.map_err(MeowError::Io)?;
                 Ok(Box::new(StreamConn(stream)) as Box<dyn ProxyConn>)
             })
@@ -190,7 +203,7 @@ impl TrojanAdapter {
         Ok(&out[..pos])
     }
 
-    /// Open a TLS stream and write the Trojan request header.
+    /// Open a TLS (+ transport) stream and write the Trojan request header.
     async fn open_tls_with_header(
         &self,
         metadata: &Metadata,
@@ -204,7 +217,7 @@ impl TrojanAdapter {
         self.tls_header_over(tcp, metadata, cmd).await
     }
 
-    /// TLS-wrap `stream` and write the Trojan request header targeting
+    /// Wrap `stream` in TLS (+ transport) and write the Trojan request header targeting
     /// `metadata`.  `stream` must already terminate at this Trojan server —
     /// `dial_tcp`/`dial_udp` obtain it from `dialer.dial`, `connect_over`
     /// receives it from the relay chain.
@@ -217,11 +230,7 @@ impl TrojanAdapter {
         let mut hdr_buf = [0u8; TROJAN_HEADER_BUF_SIZE];
         let header = self.build_header(metadata, cmd, &mut hdr_buf)?;
 
-        let mut stream = self
-            .tls_layer
-            .connect(stream)
-            .await
-            .map_err(transport_to_proxy_err)?;
+        let mut stream = self.transport.connect(stream).await?;
 
         stream.write_all(header).await.map_err(MeowError::Io)?;
         Ok(stream)

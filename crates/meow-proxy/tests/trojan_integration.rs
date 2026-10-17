@@ -629,3 +629,140 @@ async fn test_trojan_connect_over_runs_tls_and_handshake() {
     conn.read_exact(&mut buf).await.expect("read_exact failed");
     assert_eq!(&buf, payload, "echo mismatch through connect_over");
 }
+
+/// Start a mock Trojan-over-WebSocket server: TLS, then a WebSocket
+/// upgrade, then the Trojan header inside binary frames.  After the header it
+/// echoes the payload back (no upstream dial), which is enough to prove the
+/// adapter layers TLS → WS → Trojan in that order.
+async fn start_mock_trojan_ws_server(
+    cert_der: rustls::pki_types::CertificateDer<'static>,
+    key_der: rustls::pki_types::PrivateKeyDer<'static>,
+    expected_port: u16,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let expected_hex = trojan_hex_password(TROJAN_PASSWORD);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let expected_hex = expected_hex.clone();
+            tokio::spawn(async move {
+                let tls = acceptor.accept(tcp).await.expect("TLS accept");
+                let mut ws = tokio_tungstenite::accept_async(tls)
+                    .await
+                    .expect("WebSocket upgrade");
+                // password(56) CRLF CMD ATYP=IPv4 IP(4) PORT(2) CRLF
+                const HEADER_LEN: usize = 56 + 2 + 1 + 1 + 4 + 2 + 2;
+                let mut buf = Vec::new();
+                let mut header_done = false;
+                while let Some(Ok(msg)) = ws.next().await {
+                    match msg {
+                        Message::Binary(data) => buf.extend_from_slice(&data),
+                        Message::Close(_) => break,
+                        _ => continue,
+                    }
+                    if !header_done {
+                        if buf.len() < HEADER_LEN {
+                            continue;
+                        }
+                        assert_eq!(&buf[..56], expected_hex.as_bytes());
+                        assert_eq!(&buf[56..58], b"\r\n");
+                        assert_eq!(buf[58], 0x01, "CMD must be CONNECT");
+                        assert_eq!(buf[59], 0x01, "ATYP must be IPv4");
+                        assert_eq!(&buf[60..64], &[127, 0, 0, 1]);
+                        assert_eq!(u16::from_be_bytes([buf[64], buf[65]]), expected_port);
+                        assert_eq!(&buf[66..68], b"\r\n");
+                        buf.drain(..HEADER_LEN);
+                        header_done = true;
+                    }
+                    if !buf.is_empty() {
+                        let payload = std::mem::take(&mut buf);
+                        if ws.send(Message::Binary(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    (addr, handle)
+}
+
+/// `network: ws` — the Trojan header and payload ride inside WebSocket
+/// frames over TLS.  The mock server rejects anything that is not a TLS
+/// handshake followed by an HTTP upgrade, so a missing or misordered layer
+/// fails the dial.
+#[tokio::test]
+async fn test_trojan_over_websocket_transport() {
+    use meow_proxy::TransportChain;
+    use meow_transport::tls::{TlsConfig, TlsLayer};
+    use meow_transport::ws::{WsConfig, WsLayer};
+
+    install_crypto_provider();
+    let (cert_der, key_der) = generate_self_signed_cert();
+    let target_port = 4242;
+    let (trojan_addr, _handle) = start_mock_trojan_ws_server(cert_der, key_der, target_port).await;
+
+    let mut tls_cfg = TlsConfig::new("localhost");
+    tls_cfg.skip_cert_verify = true;
+    tls_cfg.alpn = vec!["http/1.1".to_string()];
+    let mut chain = TransportChain::empty();
+    chain.push(Box::new(TlsLayer::new(&tls_cfg).unwrap()));
+    chain.push(Box::new(
+        WsLayer::new(WsConfig {
+            path: "/trojan".to_string(),
+            host_header: Some("localhost".to_string()),
+            extra_headers: vec![],
+            max_early_data: 0,
+            early_data_header_name: None,
+        })
+        .unwrap(),
+    ));
+
+    let adapter = TrojanAdapter::new(
+        "test-trojan-ws",
+        "127.0.0.1",
+        trojan_addr.port(),
+        TROJAN_PASSWORD,
+        "localhost",
+        true,
+        false,
+        std::sync::Arc::new(meow_proxy::dialer::DirectDialer),
+    )
+    .with_transport(chain);
+
+    let metadata = Metadata {
+        network: Network::Tcp,
+        dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        dst_port: target_port,
+        ..Default::default()
+    };
+    let mut conn = timeout(TIMEOUT, adapter.dial_tcp(&metadata))
+        .await
+        .expect("dial timed out")
+        .expect("dial failed");
+
+    for payload in [&b"hello trojan over ws"[..], &b"second ws frame"[..]] {
+        conn.write_all(payload).await.expect("write failed");
+        conn.flush().await.expect("flush failed");
+        let mut buf = vec![0u8; payload.len()];
+        timeout(TIMEOUT, conn.read_exact(&mut buf))
+            .await
+            .expect("read timed out")
+            .expect("read_exact failed");
+        assert_eq!(buf, payload, "echo mismatch over ws transport");
+    }
+}

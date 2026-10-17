@@ -1246,6 +1246,128 @@ proxies:
 }
 
 #[tokio::test]
+async fn test_vmess_with_grpc_and_h2_transports() {
+    let yaml = r#"
+proxies:
+  - name: "vmess-grpc"
+    type: vmess
+    server: "example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    cipher: auto
+    network: grpc
+    grpc-opts:
+      grpc-service-name: GunService
+  - name: "vmess-grpc-tls"
+    type: vmess
+    server: "example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    cipher: auto
+    tls: true
+    servername: cdn.example.com
+    network: grpc
+  - name: "vmess-h2"
+    type: vmess
+    server: "example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    cipher: auto
+    network: h2
+    h2-opts:
+      host: [example.com]
+      path: /h2
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    for name in ["vmess-grpc", "vmess-grpc-tls", "vmess-h2"] {
+        assert!(config.proxies.contains_key(name), "{name} must parse");
+    }
+}
+
+#[tokio::test]
+async fn test_vmess_rejects_empty_h2_hosts_and_unknown_network() {
+    let yaml = r#"
+proxies:
+  - name: "vmess-h2-empty"
+    type: vmess
+    server: "example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    network: h2
+    h2-opts:
+      host: []
+  - name: "vmess-quic"
+    type: vmess
+    server: "example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    network: quic
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(!config.proxies.contains_key("vmess-h2-empty"));
+    assert!(!config.proxies.contains_key("vmess-quic"));
+}
+
+#[tokio::test]
+async fn test_trojan_with_ws_grpc_and_h2_transports() {
+    let yaml = r#"
+proxies:
+  - name: "trojan-ws"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "secret"
+    sni: cdn.example.com
+    network: ws
+    ws-opts:
+      path: /trojan
+      headers:
+        Host: cdn.example.com
+  - name: "trojan-grpc"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "secret"
+    network: grpc
+    grpc-opts:
+      grpc-service-name: GunService
+  - name: "trojan-h2"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "secret"
+    network: h2
+    h2-opts:
+      path: /h2
+  - name: "trojan-tcp"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "secret"
+    network: tcp
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    for name in ["trojan-ws", "trojan-grpc", "trojan-h2", "trojan-tcp"] {
+        assert!(config.proxies.contains_key(name), "{name} must parse");
+    }
+}
+
+#[tokio::test]
+async fn test_trojan_rejects_unknown_network() {
+    let yaml = r#"
+proxies:
+  - name: "trojan-xhttp"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "secret"
+    network: xhttp
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(!config.proxies.contains_key("trojan-xhttp"));
+}
+
+#[tokio::test]
 async fn test_rule_parsing() {
     let yaml = r#"
 rules:

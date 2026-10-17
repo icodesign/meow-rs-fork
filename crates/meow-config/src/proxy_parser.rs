@@ -302,7 +302,8 @@ pub fn parse_proxy_with_dialer(
                 .and_then(serde_yaml::Value::as_bool)
                 .unwrap_or(false);
 
-            #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
+            let transport = parse_trojan_transport(name, config, server, sni, skip_verify)?;
+
             let mut adapter = TrojanAdapter::new(
                 name,
                 server,
@@ -313,6 +314,9 @@ pub fn parse_proxy_with_dialer(
                 udp,
                 Arc::clone(dialer),
             );
+            if let Some(transport) = transport {
+                adapter = adapter.with_transport(transport);
+            }
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
                 // muxcool rides VLESS CommandMux; trojan has no equivalent
@@ -1635,7 +1639,7 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
 /// Parse `ws-opts.max-early-data`: absent → `0` (disabled); a value above
 /// the ceiling clamps with a warning (`meow-transport` re-clamps at
 /// connect for programmatic configs — issue #648).
-#[cfg(any(feature = "vless", feature = "vmess"))]
+#[cfg(any(feature = "vless", feature = "vmess", feature = "trojan"))]
 fn ws_max_early_data(ws_opts: Option<&serde_yaml::Value>) -> usize {
     ws_opts
         .and_then(|o| o.get("max-early-data"))
@@ -1651,6 +1655,107 @@ fn ws_max_early_data(ws_opts: Option<&serde_yaml::Value>) -> usize {
             v
         })
         .min(meow_transport::ws::MAX_WS_EARLY_DATA)
+}
+
+/// Build the `network: ws` layer from `ws-opts`. `default_host` fills the
+/// `Host` header when `ws-opts.headers.Host` is absent — `WsLayer::new`
+/// requires one, and normalization is the config layer's job (ADR-0001 §1 —
+/// the transport never infers values from context).
+#[cfg(any(feature = "vless", feature = "vmess", feature = "trojan"))]
+fn ws_transport_layer(
+    config: &HashMap<String, serde_yaml::Value>,
+    default_host: &str,
+    proto: &str,
+) -> std::result::Result<meow_transport::ws::WsLayer, String> {
+    use meow_transport::ws::{WsConfig, WsLayer};
+    let ws_opts = config.get("ws-opts");
+    let path = ws_opts
+        .and_then(|o| o.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let host_header = ws_opts
+        .and_then(|o| o.get("headers"))
+        .and_then(|h| h.get("Host"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_host)
+        .to_string();
+    // `max-early-data` buffers caller writes until the upgrade
+    // completes — clamped to the 2048-byte ceiling (the transport
+    // layer re-clamps programmatic configs at connect; #648).
+    let max_early_data = ws_max_early_data(ws_opts);
+    let early_data_header_name = ws_opts
+        .and_then(|o| o.get("early-data-header-name"))
+        .and_then(|v| v.as_str())
+        .map(std::string::ToString::to_string);
+    let ws_cfg = WsConfig {
+        path,
+        host_header: Some(host_header),
+        extra_headers: vec![],
+        max_early_data,
+        early_data_header_name,
+    };
+    WsLayer::new(ws_cfg).map_err(|e| format!("{proto}: ws layer error: {e}"))
+}
+
+/// Build the `network: grpc` (gun) layer from `grpc-opts`. `authority` is the
+/// resolved `:authority` — mihomo's gun transport sends the TLS server name,
+/// falling back to the dial host (issue #377); resolved by the caller per
+/// ADR-0001 §1.
+#[cfg(any(feature = "vless", feature = "vmess", feature = "trojan"))]
+fn grpc_transport_layer(
+    config: &HashMap<String, serde_yaml::Value>,
+    authority: &str,
+) -> meow_transport::grpc::GrpcLayer {
+    use meow_transport::grpc::{GrpcConfig, GrpcLayer};
+    let service_name = config
+        .get("grpc-opts")
+        .and_then(|o| o.get("grpc-service-name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("GunService")
+        .to_string();
+    GrpcLayer::new(GrpcConfig {
+        service_name,
+        authority: authority.to_string(),
+    })
+}
+
+/// Build the `network: h2` layer from `h2-opts`.
+#[cfg(any(feature = "vless", feature = "vmess", feature = "trojan"))]
+fn h2_transport_layer(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    server: &str,
+    proto: &str,
+) -> std::result::Result<meow_transport::h2::H2Layer, String> {
+    use meow_transport::h2::{H2Config, H2Layer};
+    let h2_opts = config.get("h2-opts");
+    let path = h2_opts
+        .and_then(|o| o.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("/")
+        .to_string();
+    // `h2-opts.host` is a list; default to server when absent.
+    // Class A: empty host list is rejected — H2Layer asserts non-empty
+    // (debug) and upstream requires at least one authority value.
+    let hosts: Vec<String> = h2_opts
+        .and_then(|o| o.get("host"))
+        .and_then(|v| v.as_sequence())
+        .map_or_else(
+            || vec![server.to_string()],
+            |seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                    .collect()
+            },
+        );
+    if hosts.is_empty() {
+        return Err(format!(
+            "{proto}: h2-opts.host must not be empty for proxy '{name}' \
+             (H2 requires at least one authority value)"
+        ));
+    }
+    Ok(H2Layer::new(H2Config { path, hosts }))
 }
 
 /// Parse a `type: vless` proxy config block into a `VlessAdapter`.
@@ -1919,96 +2024,23 @@ fn parse_vless(
     match network {
         "tcp" => {} // no extra layer
         "ws" => {
-            use meow_transport::ws::{WsConfig, WsLayer};
-            let ws_opts = config.get("ws-opts");
-            let path = ws_opts
-                .and_then(|o| o.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("/")
-                .to_string();
-            // host_header: user-supplied Host, or fall back to server address.
-            // WsLayer::new requires Some; normalization is the config layer's job
-            // (ADR-0001 §1 — transport never infers values from context).
-            let host_header = ws_opts
-                .and_then(|o| o.get("headers"))
-                .and_then(|h| h.get("Host"))
-                .and_then(|v| v.as_str())
-                .map_or_else(|| server.to_string(), std::string::ToString::to_string);
-            // `max-early-data` buffers caller writes until the upgrade
-            // completes — clamped to the 2048-byte ceiling (the transport
-            // layer re-clamps programmatic configs at connect; #648).
-            let max_early_data = ws_max_early_data(ws_opts);
-            let early_data_header_name = ws_opts
-                .and_then(|o| o.get("early-data-header-name"))
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
-            let ws_cfg = WsConfig {
-                path,
-                host_header: Some(host_header),
-                extra_headers: vec![],
-                max_early_data,
-                early_data_header_name,
-            };
-            let ws_layer =
-                WsLayer::new(ws_cfg).map_err(|e| format!("vless: ws layer error: {e}"))?;
-            chain.push(Box::new(ws_layer));
+            chain.push(Box::new(ws_transport_layer(config, server, "vless")?));
         }
         "grpc" => {
-            use meow_transport::grpc::{GrpcConfig, GrpcLayer};
-            let grpc_opts = config.get("grpc-opts");
-            let service_name = grpc_opts
-                .and_then(|o| o.get("grpc-service-name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("GunService")
-                .to_string();
             // Authority: mihomo's gun transport sets `Host` to `servername`
             // and only falls back to the dial host when `servername` is empty
             // (adapter/outbound/vless.go). Front-ends that route gRPC by
             // `:authority` are provisioned against that value, so match it
-            // rather than always sending the dial host (issue #377). Resolved
-            // here per ADR-0001 §1 — the transport never infers it.
+            // rather than always sending the dial host (issue #377).
             let authority = config
                 .get("servername")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .unwrap_or(server)
-                .to_string();
-            let grpc_cfg = GrpcConfig {
-                service_name,
-                authority,
-            };
-            chain.push(Box::new(GrpcLayer::new(grpc_cfg)));
+                .unwrap_or(server);
+            chain.push(Box::new(grpc_transport_layer(config, authority)));
         }
         "h2" => {
-            use meow_transport::h2::{H2Config, H2Layer};
-            let h2_opts = config.get("h2-opts");
-            let path = h2_opts
-                .and_then(|o| o.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("/")
-                .to_string();
-            // `h2-opts.host` is a list; default to server when absent.
-            // Class A: empty host list is rejected — H2Layer asserts non-empty
-            // (debug) and upstream requires at least one authority value.
-            let hosts: Vec<String> = h2_opts
-                .and_then(|o| o.get("host"))
-                .and_then(|v| v.as_sequence())
-                .map_or_else(
-                    || vec![server.to_string()],
-                    |seq| {
-                        seq.iter()
-                            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                            .collect()
-                    },
-                );
-            if hosts.is_empty() {
-                return Err(format!(
-                    "vless: h2-opts.host must not be empty for proxy '{name}' \
-                     (H2 requires at least one authority value)"
-                ));
-            }
-            let h2_cfg = H2Config { path, hosts };
-            chain.push(Box::new(H2Layer::new(h2_cfg)));
+            chain.push(Box::new(h2_transport_layer(name, config, server, "vless")?));
         }
         "httpupgrade" => {
             use meow_transport::httpupgrade::{
@@ -2541,7 +2573,7 @@ fn decode_raw_url_base64_lenient(s: &str) -> Option<Vec<u8>> {
 /// on HTTP/2 and many servers — xray REALITY in particular — reject a client
 /// that does not offer `h2` (issue #377). An explicit `alpn:` always wins.
 /// upstream: mihomo forces `h2` in its gun (gRPC) transport TLS config.
-#[cfg(any(feature = "vless", feature = "vmess"))]
+#[cfg(any(feature = "vless", feature = "vmess", feature = "trojan"))]
 fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
     if !alpn.is_empty() {
         return alpn;
@@ -2811,6 +2843,65 @@ fn serialize_plugin_opts(opts: &serde_yaml::Value) -> Option<String> {
     }
 }
 
+/// Build the Trojan transport chain for a non-`tcp` `network`: TLS (the same
+/// SNI / verification the adapter defaults to, with the ALPN defaulted per
+/// transport) followed by the ws / grpc / h2 layer. `Ok(None)` for raw TCP,
+/// where the adapter's built-in TLS-only chain is used unchanged.
+/// upstream: mihomo adapter/outbound/trojan.go (`network`: ws, grpc; h2 as
+/// for VLESS/VMess).
+#[cfg(feature = "trojan")]
+fn parse_trojan_transport(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    server: &str,
+    sni: &str,
+    skip_verify: bool,
+) -> std::result::Result<Option<meow_proxy::TransportChain>, String> {
+    use meow_transport::tls::{TlsConfig, TlsLayer};
+    let network = config
+        .get("network")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tcp");
+    if network == "tcp" {
+        return Ok(None);
+    }
+    let server_name = if sni.is_empty() { server } else { sni };
+    let alpn: Vec<String> = config
+        .get("alpn")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut tls_cfg = TlsConfig::new(server_name);
+    tls_cfg.skip_cert_verify = skip_verify;
+    tls_cfg.alpn = default_transport_alpn(network, alpn);
+    let tls_layer = TlsLayer::new(&tls_cfg).map_err(|e| format!("trojan: TLS layer error: {e}"))?;
+
+    let mut chain = meow_proxy::TransportChain::empty();
+    chain.push(Box::new(tls_layer));
+    match network {
+        // mihomo's trojan ws transport sends the SNI as `Host` unless
+        // `ws-opts.headers.Host` overrides it.
+        "ws" => chain.push(Box::new(ws_transport_layer(config, server_name, "trojan")?)),
+        "grpc" => chain.push(Box::new(grpc_transport_layer(config, server_name))),
+        "h2" => chain.push(Box::new(h2_transport_layer(
+            name,
+            config,
+            server_name,
+            "trojan",
+        )?)),
+        other => {
+            return Err(format!(
+                "trojan: unsupported network '{other}'; valid values: tcp, ws, grpc, h2"
+            ));
+        }
+    }
+    Ok(Some(chain))
+}
+
 #[cfg(feature = "vmess")]
 fn parse_vmess(
     name: &str,
@@ -2920,40 +3011,23 @@ fn parse_vmess(
     match network {
         "tcp" => {}
         "ws" => {
-            use meow_transport::ws::{WsConfig, WsLayer};
-            let ws_opts = config.get("ws-opts");
-            let path = ws_opts
-                .and_then(|o| o.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("/")
-                .to_string();
-            let host_header = ws_opts
-                .and_then(|o| o.get("headers"))
-                .and_then(|h| h.get("Host"))
-                .and_then(|v| v.as_str())
-                .map_or_else(|| server.to_string(), std::string::ToString::to_string);
-            // `max-early-data` buffers caller writes until the upgrade
-            // completes — clamped to the 2048-byte ceiling (the transport
-            // layer re-clamps programmatic configs at connect; #648).
-            let max_early_data = ws_max_early_data(ws_opts);
-            let early_data_header_name = ws_opts
-                .and_then(|o| o.get("early-data-header-name"))
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
-            let ws_cfg = WsConfig {
-                path,
-                host_header: Some(host_header),
-                extra_headers: vec![],
-                max_early_data,
-                early_data_header_name,
+            chain.push(Box::new(ws_transport_layer(config, server, "vmess")?));
+        }
+        "grpc" => {
+            // Same authority resolution as VLESS (mihomo adapter/outbound/vmess.go).
+            let authority = if servername.is_empty() {
+                server
+            } else {
+                servername
             };
-            let ws_layer =
-                WsLayer::new(ws_cfg).map_err(|e| format!("vmess: ws layer error: {e}"))?;
-            chain.push(Box::new(ws_layer));
+            chain.push(Box::new(grpc_transport_layer(config, authority)));
+        }
+        "h2" => {
+            chain.push(Box::new(h2_transport_layer(name, config, server, "vmess")?));
         }
         other => {
             return Err(format!(
-                "vmess: unsupported network '{other}'; valid values: tcp, ws"
+                "vmess: unsupported network '{other}'; valid values: tcp, ws, grpc, h2"
             ));
         }
     }
