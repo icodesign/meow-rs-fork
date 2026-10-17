@@ -279,6 +279,9 @@ pub struct ApiServer {
     /// Provider-dialer cell `PUT /configs` rebuilds hand to newly declared
     /// providers (issue #489).
     provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// Host-owned environment `PUT /configs` re-applies to replacement
+    /// documents. Set by embedders via [`Self::with_runtime_environment`].
+    runtime_environment: Option<meow_config::ConfigRuntimeEnvironment>,
 }
 
 impl ApiServer {
@@ -321,7 +324,19 @@ impl ApiServer {
             external_ui,
             dns_server,
             provider_dialer_registry,
+            runtime_environment: None,
         }
+    }
+
+    /// Re-apply the environment startup materialized (captured `system://`
+    /// nameservers, trusted GeoData paths) to every `PUT /configs` document.
+    #[must_use]
+    pub fn with_runtime_environment(
+        mut self,
+        environment: meow_config::ConfigRuntimeEnvironment,
+    ) -> Self {
+        self.runtime_environment = Some(environment);
+        self
     }
 
     /// Bind and serve in one call. Kept for callers that await `run()`
@@ -354,6 +369,7 @@ impl ApiServer {
             traffic_feed: Default::default(),
             dns_server: Arc::clone(&self.dns_server),
             provider_dialer_registry: self.provider_dialer_registry.clone(),
+            runtime_environment: self.runtime_environment.clone(),
         });
 
         let app = routes::create_router(state);

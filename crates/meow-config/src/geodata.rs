@@ -282,3 +282,38 @@ mod tests {
         parse_geodata(Some(&raw)).unwrap();
     }
 }
+
+/// Validate a host-staged asset with the same parsers used by the runtime.
+/// Publication must reject a well-hashed file whose format is unusable.
+pub fn validate_asset(kind: &str, path: &Path) -> anyhow::Result<()> {
+    match kind {
+        "geoip" | "asn" => {
+            let reader = maxminddb::Reader::open_readfile(path)?;
+            let expected = if kind == "geoip" { "Country" } else { "ASN" };
+            if !reader.metadata.database_type.contains(expected) {
+                return Err(anyhow!(
+                    "{kind} database has unexpected type {}",
+                    reader.metadata.database_type
+                ));
+            }
+        }
+        "geosite" => {
+            meow_rules::geosite::GeositeDB::load_from_path(path, None)?;
+        }
+        _ => return Err(anyhow!("unsupported GeoData asset kind: {kind}")),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod host_asset_tests {
+    #[test]
+    fn rejects_corrupt_databases_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad");
+        std::fs::write(&path, b"not a database").unwrap();
+        for kind in ["geoip", "asn", "geosite"] {
+            assert!(super::validate_asset(kind, &path).is_err(), "{kind}");
+        }
+    }
+}

@@ -107,6 +107,11 @@ pub struct AppState {
     /// after spawning the server; `PUT /configs` hot-swaps the resolver
     /// slot or rebinds the socket on a `dns.listen` change (issue #514).
     pub dns_server: Arc<RwLock<Option<DnsServerHandle>>>,
+    /// Host-owned inputs (captured `system://` nameservers, trusted GeoData
+    /// paths) startup materialized into the running config. `PUT /configs`
+    /// applies them to the replacement document so it rebuilds against the
+    /// same environment. `None` for plain YAML-driven daemons.
+    pub runtime_environment: Option<meow_config::ConfigRuntimeEnvironment>,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -2861,6 +2866,20 @@ async fn put_configs(
         }
     };
 
+    // Host-owned environment (trusted GeoData paths, `system://` upstreams)
+    // never travels in the document; apply it the way startup did, or GEOIP /
+    // GEOSITE rules and system nameservers fail to rebuild. Not
+    // force-overridable: without it the candidate cannot be built faithfully.
+    if let Some(environment) = &state.runtime_environment {
+        if let Err(e) = environment.materialize(&mut raw_config) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message": format!("runtime environment error: {e}")})),
+            )
+                .into_response();
+        }
+    }
+
     // Duplicate `subscriptions:` names must never commit — not even under
     // `?force=true`: they split `applied-*` contribution bookkeeping
     // between same-named entries, and the persisted file would then fail
@@ -4306,6 +4325,7 @@ mod outbound_flush_tests {
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            runtime_environment: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -4450,6 +4470,7 @@ mod global_route_binding_tests {
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            runtime_environment: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),

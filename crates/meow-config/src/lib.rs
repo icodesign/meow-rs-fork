@@ -42,6 +42,176 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Ephemeral platform state required to materialize a runtime config.
+///
+/// Mihomo's `system://` nameserver marker belongs in persisted config text,
+/// but it must resolve to the embedding process's pre-tunnel DNS servers when
+/// a runtime is built. Keeping those addresses in this separate value prevents
+/// environment-specific state from leaking into saved YAML or content hashes.
+#[derive(Debug, Clone)]
+pub struct ConfigRuntimeEnvironment {
+    system_dns_servers: Vec<SocketAddr>,
+    geodata: Option<RuntimeGeoDataPaths>,
+    allow_geodata_downloads: bool,
+}
+
+/// Host-owned GeoData paths supplied outside the untrusted YAML document.
+///
+/// Embedders such as an iOS Network Extension use this to point meow-config at
+/// immutable files prepared by the containing app. Generic meow-rs callers can
+/// keep expressing paths in YAML and use the default environment instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeGeoDataPaths {
+    pub mmdb_path: PathBuf,
+    pub asn_path: PathBuf,
+    pub geosite_path: PathBuf,
+}
+
+impl RuntimeGeoDataPaths {
+    pub fn new(mmdb_path: PathBuf, asn_path: PathBuf, geosite_path: PathBuf) -> Self {
+        Self {
+            mmdb_path,
+            asn_path,
+            geosite_path,
+        }
+    }
+}
+
+impl Default for ConfigRuntimeEnvironment {
+    fn default() -> Self {
+        Self {
+            system_dns_servers: Vec::new(),
+            geodata: None,
+            allow_geodata_downloads: true,
+        }
+    }
+}
+
+impl ConfigRuntimeEnvironment {
+    /// Create an environment from DNS servers captured by the embedding host.
+    pub fn new(system_dns_servers: Vec<SocketAddr>) -> Self {
+        let mut unique_servers = Vec::with_capacity(system_dns_servers.len());
+        for server in system_dns_servers {
+            if !unique_servers.contains(&server) {
+                unique_servers.push(server);
+            }
+        }
+        Self {
+            system_dns_servers: unique_servers,
+            ..Self::default()
+        }
+    }
+
+    /// Disable all GeoData network I/O during configuration materialization.
+    /// Missing required files then surface through the normal loader errors.
+    pub fn without_geodata_downloads(mut self) -> Self {
+        self.allow_geodata_downloads = false;
+        self
+    }
+
+    /// Install host-owned GeoData paths and disable downloads.
+    ///
+    /// The host paths replace any YAML-provided path/URL/update policy before
+    /// parsing. This keeps the filesystem authority outside subscription data.
+    pub fn with_geodata_paths(mut self, geodata: RuntimeGeoDataPaths) -> Self {
+        self.geodata = Some(geodata);
+        self.allow_geodata_downloads = false;
+        self
+    }
+
+    /// Apply this environment to a raw document exactly as startup does:
+    /// expand `system://` nameservers and install host-owned GeoData paths.
+    ///
+    /// Runtime reload paths that accept a whole replacement document
+    /// (`PUT /configs`) must call this too — the document carries neither
+    /// value, so rebuilding it bare would resolve GeoData against default
+    /// paths and reject `system://` upstreams.
+    pub fn materialize(&self, raw: &mut raw::RawConfig) -> Result<(), anyhow::Error> {
+        self.materialize_system_dns(raw)?;
+        self.materialize_geodata(raw);
+        Ok(())
+    }
+
+    fn materialize_geodata(&self, raw: &mut raw::RawConfig) -> bool {
+        let Some(paths) = &self.geodata else {
+            return false;
+        };
+        let geodata = raw.geodata.get_or_insert_with(Default::default);
+        geodata.mmdb_path = Some(paths.mmdb_path.to_string_lossy().into_owned());
+        geodata.asn_path = Some(paths.asn_path.to_string_lossy().into_owned());
+        geodata.geosite_path = Some(paths.geosite_path.to_string_lossy().into_owned());
+        geodata.auto_update = false;
+        geodata.auto_update_interval = None;
+        geodata.url = None;
+        true
+    }
+
+    fn materialize_system_dns(&self, raw: &mut raw::RawConfig) -> Result<(), anyhow::Error> {
+        let Some(dns) = raw.dns.as_mut() else {
+            return Ok(());
+        };
+        expand_system_nameservers(&mut dns.nameserver, &self.system_dns_servers)?;
+        expand_system_nameservers(&mut dns.default_nameserver, &self.system_dns_servers)?;
+        expand_system_nameservers(&mut dns.fallback, &self.system_dns_servers)?;
+        if let Some(policy) = dns.nameserver_policy.as_mut() {
+            for servers in policy.values_mut() {
+                match servers {
+                    raw::RawNspValue::One(server) => {
+                        let mut values = vec![server.clone()];
+                        expand_system_nameserver_values(&mut values, &self.system_dns_servers)?;
+                        *servers = match values.as_slice() {
+                            [value] => raw::RawNspValue::One(value.clone()),
+                            _ => raw::RawNspValue::Many(values),
+                        };
+                    }
+                    raw::RawNspValue::Many(values) => {
+                        expand_system_nameserver_values(values, &self.system_dns_servers)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn expand_system_nameservers(
+    servers: &mut Option<Vec<String>>,
+    system_dns_servers: &[SocketAddr],
+) -> Result<(), anyhow::Error> {
+    if let Some(servers) = servers {
+        expand_system_nameserver_values(servers, system_dns_servers)?;
+    }
+    Ok(())
+}
+
+fn expand_system_nameserver_values(
+    servers: &mut Vec<String>,
+    system_dns_servers: &[SocketAddr],
+) -> Result<(), anyhow::Error> {
+    let mut expanded = Vec::with_capacity(servers.len().max(system_dns_servers.len()));
+    for server in std::mem::take(servers) {
+        if is_system_nameserver_marker(&server) {
+            if system_dns_servers.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "system:// requires captured system DNS servers in the runtime environment"
+                ));
+            }
+            expanded.extend(system_dns_servers.iter().map(ToString::to_string));
+        } else {
+            expanded.push(server);
+        }
+    }
+    *servers = expanded;
+    Ok(())
+}
+
+fn is_system_nameserver_marker(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "system" | "system://"
+    )
+}
+
 pub(crate) async fn spawn_blocking_with_current_dispatcher<F, R>(
     f: F,
 ) -> Result<R, tokio::task::JoinError>
@@ -96,6 +266,7 @@ pub struct Config {
     pub auth: Arc<AuthConfig>,
     pub raw: raw::RawConfig,
     pub geodata: GeoDataConfig,
+    pub trusted_geodata: bool,
 }
 
 pub struct GeneralConfig {
@@ -655,9 +826,17 @@ pub fn external_plugins_allowed() -> bool {
 }
 
 pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
+    load_config_with_environment(path, &ConfigRuntimeEnvironment::default()).await
+}
+
+/// Load a config file with embedding-provided ephemeral runtime state.
+pub async fn load_config_with_environment(
+    path: &str,
+    environment: &ConfigRuntimeEnvironment,
+) -> Result<Config, anyhow::Error> {
     let raw = load_raw_config(path).await?;
     let cache_dir = resource_cache_dir_for_config_path(path);
-    build_config(raw, Some(cache_dir.as_path())).await
+    build_config_with_environment(raw, Some(cache_dir.as_path()), environment).await
 }
 
 /// Read and parse the config file at `path` into a [`raw::RawConfig`]
@@ -684,8 +863,16 @@ pub async fn load_raw_config(path: &str) -> Result<raw::RawConfig, anyhow::Error
 }
 
 pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error> {
+    load_config_from_str_with_environment(content, &ConfigRuntimeEnvironment::default()).await
+}
+
+/// Load an in-memory config with embedding-provided ephemeral runtime state.
+pub async fn load_config_from_str_with_environment(
+    content: &str,
+    environment: &ConfigRuntimeEnvironment,
+) -> Result<Config, anyhow::Error> {
     let raw: raw::RawConfig = parse_raw_yaml(content)?;
-    build_config(raw, None).await
+    build_config_with_environment(raw, None, environment).await
 }
 
 /// Upper bound on YAML document nesting for remote-controlled documents.
@@ -3806,9 +3993,19 @@ fn build_named_listeners(
 /// [`resource_cache_dir_for_config_path`] of the config file, or `None`
 /// for a document with no backing file (`--config-string`).
 pub async fn build_config(
-    mut raw: raw::RawConfig,
+    raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
+    build_config_with_environment(raw, cache_dir, &ConfigRuntimeEnvironment::default()).await
+}
+
+async fn build_config_with_environment(
+    mut raw: raw::RawConfig,
+    cache_dir: Option<&Path>,
+    environment: &ConfigRuntimeEnvironment,
+) -> Result<Config, anyhow::Error> {
+    environment.materialize_system_dns(&mut raw)?;
+    let trusted_geodata = environment.materialize_geodata(&mut raw);
     // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
     // sync `parse_proxy` path that follows can stay sync. Failures warn
     // and leave the map unchanged — except the `enable: true` with no
@@ -3933,7 +4130,9 @@ pub async fn build_config(
     // must happen before building the parser context, which hard-errors on
     // missing GeoIP/ASN files.
     let geo_scan_lines = collect_geo_scan_lines(&raw, &provider_payloads);
-    ensure_geodata(&raw, &geodata, &geo_scan_lines, prefetch_proxies.as_deref()).await;
+    if environment.allow_geodata_downloads {
+        ensure_geodata(&raw, &geodata, &geo_scan_lines, prefetch_proxies.as_deref()).await;
+    }
     drop(geo_scan_lines);
     drop(prefetch_proxies);
 
@@ -4099,6 +4298,7 @@ pub async fn build_config(
         auth,
         raw,
         geodata,
+        trusted_geodata,
     })
 }
 
@@ -7576,6 +7776,153 @@ mod dns_provider_sharing_tests {
         assert!(
             result.prefetched_payloads.is_empty(),
             "a shared rebuild carries no payload snapshot"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_environment_tests {
+    use super::RuntimeGeoDataPaths;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    use super::{
+        load_config_from_str, load_config_from_str_with_environment, ConfigRuntimeEnvironment,
+    };
+
+    #[tokio::test]
+    async fn materializes_system_nameserver_from_embedding_environment() {
+        let environment = ConfigRuntimeEnvironment::new(vec![SocketAddr::from(([9, 9, 9, 9], 53))]);
+        load_config_from_str_with_environment(
+            r#"
+dns:
+  enable: true
+  nameserver:
+    - system://
+rules:
+  - MATCH,DIRECT
+"#,
+            &environment,
+        )
+        .await
+        .expect("system:// should materialize from the supplied environment");
+    }
+
+    #[tokio::test]
+    async fn rejects_system_nameserver_without_embedding_environment() {
+        let result = load_config_from_str_with_environment(
+            r#"
+dns:
+  enable: true
+  nameserver:
+    - system://
+rules:
+  - MATCH,DIRECT
+"#,
+            &ConfigRuntimeEnvironment::default(),
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("system:// cannot silently fall back inside an empty environment")
+        };
+
+        assert!(error
+            .to_string()
+            .contains("system:// requires captured system DNS"));
+    }
+
+    #[tokio::test]
+    async fn default_loader_does_not_guess_system_nameservers() {
+        let result = load_config_from_str(
+            r#"
+dns:
+  enable: true
+  nameserver:
+    - system://
+rules:
+  - MATCH,DIRECT
+"#,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("the default loader cannot guess the embedding platform's DNS servers")
+        };
+
+        assert!(error
+            .to_string()
+            .contains("system:// requires captured system DNS"));
+    }
+    #[tokio::test]
+    async fn host_geodata_replaces_yaml_authority_and_marks_config_trusted() {
+        let environment =
+            ConfigRuntimeEnvironment::default().with_geodata_paths(RuntimeGeoDataPaths::new(
+                PathBuf::from("/host/generation/Country.mmdb"),
+                PathBuf::from("/host/generation/GeoLite2-ASN.mmdb"),
+                PathBuf::from("/host/generation/geosite.dat"),
+            ));
+        let config = load_config_from_str_with_environment(
+            r#"
+geodata:
+  mmdb-path: /untrusted/Country.mmdb
+  asn-path: /untrusted/GeoLite2-ASN.mmdb
+  geosite-path: /untrusted/geosite.dat
+  auto-update: true
+  url:
+    mmdb: https://example.invalid/latest/Country.mmdb
+rules:
+  - MATCH,DIRECT
+"#,
+            &environment,
+        )
+        .await
+        .expect("host paths should materialize without loading unused databases");
+
+        assert!(config.trusted_geodata);
+        assert_eq!(
+            config.geodata.mmdb_path,
+            Some(PathBuf::from("/host/generation/Country.mmdb"))
+        );
+        assert_eq!(
+            config.geodata.asn_path,
+            Some(PathBuf::from("/host/generation/GeoLite2-ASN.mmdb"))
+        );
+        assert_eq!(
+            config.geodata.geosite_path,
+            Some(PathBuf::from("/host/generation/geosite.dat"))
+        );
+        assert!(!config.geodata.auto_update);
+        assert!(config
+            .raw
+            .geodata
+            .as_ref()
+            .is_some_and(|geo| geo.url.is_none()));
+    }
+
+    #[tokio::test]
+    async fn offline_environment_does_not_download_missing_required_geodata() {
+        let environment = ConfigRuntimeEnvironment::default().without_geodata_downloads();
+        let result = load_config_from_str_with_environment(
+            r#"
+geodata:
+  mmdb-path: /definitely-missing-potatso-geodata/Country.mmdb
+  url:
+    mmdb: https://example.invalid/latest/Country.mmdb
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,DIRECT
+"#,
+            &environment,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("missing host data must fail without a download attempt")
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("/definitely-missing-potatso-geodata/Country.mmdb"),
+            "unexpected error: {error:#}"
         );
     }
 }
