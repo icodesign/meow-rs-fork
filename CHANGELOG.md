@@ -18,6 +18,8 @@ the canonical, in-repo source a release is cut from.
   when rule matching already resolved it through the main nameservers.
   Configs without `direct-nameserver` behave as before.
 
+## [0.23.1] - 2026-10-17
+
 ### Fixed
 
 - **meow-transport builds for iOS and tvOS again**: kcptun's `dscp:` option
