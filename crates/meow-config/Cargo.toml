@@ -76,6 +76,7 @@ dashmap = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 tracing-subscriber = { workspace = true }

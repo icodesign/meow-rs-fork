@@ -1,5 +1,6 @@
 use crate::proxy_parser;
 use crate::raw::{RawHealthCheck, RawProxyProvider};
+use crate::subscription_info::SubscriptionInfo;
 use dashmap::DashMap;
 use meow_common::atomic::AtomicU;
 use meow_common::{ProviderSlot, Proxy};
@@ -128,6 +129,13 @@ pub struct ProxyProvider {
     /// `strict`-flip still re-parses the same payload under the new
     /// strictness (issue #625 review).
     content_hash: Mutex<Option<(u64, bool)>>,
+    /// Last `subscription-userinfo` an HTTP fetch reported (traffic usage
+    /// and expiry). Refreshed on every successful remote fetch — including
+    /// byte-identical payloads, since usage moves while the node list does
+    /// not — and kept when a later response omits the header (mihomo
+    /// parity). Not persisted: a cache-served bootstrap has none until the
+    /// first live fetch.
+    subscription_info: RwLock<Option<SubscriptionInfo>>,
 }
 
 /// Weak counterpart of [`ProviderSlot`].
@@ -423,6 +431,7 @@ impl ProxyProvider {
             derived: RwLock::new(Vec::new()),
             def: Self::def_identity(raw),
             content_hash: Mutex::new(None), // see field docs
+            subscription_info: RwLock::new(None),
         })
     }
 
@@ -505,15 +514,18 @@ impl ProxyProvider {
     /// for content that *parses* ([`Self::ingest`]), matching upstream's
     /// `loadBuf` order (`vehicle.Write` runs after `parser` succeeds), so
     /// a 200-OK garbage body can't durably poison the fallback cache.
-    async fn fetch_source(&self) -> Result<String, String> {
+    async fn fetch_source(&self) -> Result<(String, Option<SubscriptionInfo>), String> {
         let registry = &self.dialer_registry;
         match &self.vehicle {
-            Vehicle::File(path) => tokio::fs::read_to_string(path).await.map_err(|e| {
-                format!(
-                    "proxy-provider '{}': failed to read {:?}: {}",
-                    self.name, path, e
-                )
-            }),
+            Vehicle::File(path) => tokio::fs::read_to_string(path)
+                .await
+                .map(|text| (text, None))
+                .map_err(|e| {
+                    format!(
+                        "proxy-provider '{}': failed to read {:?}: {}",
+                        self.name, path, e
+                    )
+                }),
             Vehicle::Http { url, .. } => {
                 let download_proxy = match crate::internal_http::resolve_download_proxy(
                     registry,
@@ -534,10 +546,12 @@ impl ProxyProvider {
                         return Err(format!("proxy-provider '{}': {e:#}", self.name));
                     }
                 };
-                crate::internal_http::fetch(url, download_proxy.as_ref(), &self.header)
+                crate::internal_http::fetch_response(url, download_proxy.as_ref(), &self.header)
                     .await
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes)
+                    .and_then(|response| {
+                        let info = SubscriptionInfo::from_headers(&response.headers);
+                        String::from_utf8(response.body)
+                            .map(|text| (text, info))
                             .map_err(|e| anyhow::anyhow!("response body is not UTF-8: {e}"))
                     })
                     .map_err(|e| e.to_string())
@@ -548,19 +562,20 @@ impl ProxyProvider {
     /// Initial-load acquisition: [`Self::fetch_source`] with an on-disk
     /// cache fallback for HTTP providers — the offline bootstrap path.
     /// The returned flag is `false` when the payload came from the cache
-    /// (no point rewriting it). Deliberately NOT used by refresh ticks:
+    /// (no point rewriting it); a cache read carries no subscription info.
+    /// Deliberately NOT used by refresh ticks:
     /// a failed refresh keeps the in-memory last-good set (upstream
     /// `Update` semantics) instead of rewinding the slot to whatever
     /// generation the disk happens to hold.
-    async fn fetch_content(&self) -> Result<(String, bool), String> {
+    async fn fetch_content(&self) -> Result<(String, bool, Option<SubscriptionInfo>), String> {
         match self.fetch_source().await {
-            Ok(text) => Ok((text, true)),
+            Ok((text, info)) => Ok((text, true, info)),
             Err(e) => match &self.vehicle {
                 Vehicle::Http { cache_path, .. } => {
                     warn!(provider = %self.name, error = %e, "HTTP provider fetch failed, trying cache");
                     read_cache(cache_path.as_deref(), &self.name)
                         .await
-                        .map(|text| (text, false))
+                        .map(|text| (text, false, None))
                 }
                 Vehicle::File(_) => Err(e),
             },
@@ -699,7 +714,7 @@ impl ProxyProvider {
     /// hand its operator a daemon-wide kill switch that re-fires every tick.
     async fn initial_load(&self, strict: bool) -> anyhow::Result<bool> {
         let _generation = self.refresh_lock.lock().await;
-        let (content, from_remote) = match self.fetch_content().await {
+        let (content, from_remote, info) = match self.fetch_content().await {
             Ok(fetched) => fetched,
             Err(e) => {
                 warn_initial_load_failure(self, &e);
@@ -707,7 +722,10 @@ impl ProxyProvider {
             }
         };
         match self.ingest(content, from_remote).await {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                self.record_subscription_info(info);
+                Ok(true)
+            }
             Err(e) if strict => Err(anyhow::anyhow!("proxy-provider '{}': {e}", self.name)),
             Err(e) => {
                 warn_initial_load_failure(self, &e.to_string());
@@ -726,11 +744,12 @@ impl ProxyProvider {
         if self.fetched_remote.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let content = self.fetch_source().await?;
+        let (content, info) = self.fetch_source().await?;
         self.ingest(content, true)
             .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        self.record_subscription_info(info);
+        Ok(())
     }
 
     /// Acquire this provider's remote payload on a detached task: an empty
@@ -1024,8 +1043,11 @@ impl ProxyProvider {
         // from different payloads.
         let _generation = self.refresh_lock.lock().await;
         match self.fetch_source().await {
-            Ok(content) => match self.ingest(content, true).await {
-                Ok(_) => Ok(()),
+            Ok((content, info)) => match self.ingest(content, true).await {
+                Ok(_) => {
+                    self.record_subscription_info(info);
+                    Ok(())
+                }
                 Err(e) => {
                     // A torn payload keeps the last-good set instead of
                     // replacing it with nothing.
@@ -1047,8 +1069,18 @@ impl ProxyProvider {
     /// `declared_dialers` from different payloads.
     pub async fn acquire_initial(&self) -> anyhow::Result<()> {
         let _generation = self.refresh_lock.lock().await;
-        let (content, from_remote) = self.fetch_content().await.map_err(anyhow::Error::msg)?;
-        self.ingest(content, from_remote).await.map(|_| ())
+        let (content, from_remote, info) =
+            self.fetch_content().await.map_err(anyhow::Error::msg)?;
+        self.ingest(content, from_remote).await?;
+        self.record_subscription_info(info);
+        Ok(())
+    }
+
+    /// Keep the previous value when a response omits the header.
+    fn record_subscription_info(&self, info: Option<SubscriptionInfo>) {
+        if let Some(info) = info {
+            *self.subscription_info.write() = Some(info);
+        }
     }
 
     /// Consumes the deferred-initial-fetch flags: `true` once per provider
@@ -1075,6 +1107,11 @@ impl ProxyProvider {
     #[cfg(test)]
     fn derived_len(&self) -> usize {
         self.derived.read().len()
+    }
+
+    /// Traffic usage / expiry from the last `subscription-userinfo` header.
+    pub fn subscription_info(&self) -> Option<SubscriptionInfo> {
+        *self.subscription_info.read()
     }
 
     pub fn updated_at_secs(&self) -> u64 {
@@ -2741,6 +2778,78 @@ header:
             }
         });
         format!("http://{addr}/proxies.yaml")
+    }
+
+    /// Serves a fixed payload, answering request `i` with
+    /// `userinfo[i]` as its `subscription-userinfo` header (`None` = no
+    /// header; the last entry repeats).
+    async fn spawn_userinfo_server(userinfo: &'static [Option<&'static str>]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let body = "proxies:\n  - {name: n1, type: direct}\n";
+            for i in 0.. {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut sink = [0u8; 2048];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut sink).await;
+                let header = userinfo[i.min(userinfo.len() - 1)]
+                    .map(|v| format!("Subscription-Userinfo: {v}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n{header}Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/proxies.yaml")
+    }
+
+    /// `subscription-userinfo` tracks every live fetch — even when the
+    /// payload is byte-identical and the hash dedup skips the commit — and
+    /// survives a response that omits the header (mihomo parity).
+    #[tokio::test]
+    async fn http_provider_tracks_subscription_userinfo() {
+        let url = spawn_userinfo_server(&[
+            Some("upload=1; download=2; total=100; expire=1767225600"),
+            Some("upload=5; download=6; total=100; expire=1767225600"),
+            None,
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = raw_http_provider(&url, None);
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(p.subscription_info(), None);
+
+        p.acquire_initial().await.unwrap();
+        let first = p.subscription_info().expect("initial fetch reports usage");
+        assert_eq!((first.upload, first.download, first.total), (1, 2, 100));
+        assert_eq!(first.expire, 1_767_225_600);
+
+        p.refresh().await.unwrap();
+        let second = p.subscription_info().unwrap();
+        assert_eq!(
+            (second.upload, second.download),
+            (5, 6),
+            "an unchanged payload still refreshes usage"
+        );
+
+        p.refresh().await.unwrap();
+        assert_eq!(
+            p.subscription_info(),
+            Some(second),
+            "a response without the header keeps the last value"
+        );
     }
 
     fn raw_http_provider(url: &str, proxy: Option<&str>) -> RawProxyProvider {

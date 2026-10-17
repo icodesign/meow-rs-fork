@@ -3607,6 +3607,10 @@ struct ProviderInfo {
     expected_status: String,
     #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
+    /// mihomo `subscriptionInfo` — traffic usage / expiry from the last
+    /// `subscription-userinfo` response header.
+    #[serde(rename = "subscriptionInfo", skip_serializing_if = "Option::is_none")]
+    subscription_info: Option<meow_config::subscription_info::SubscriptionInfo>,
 }
 
 fn unix_rfc3339(seconds: u64) -> Option<String> {
@@ -3637,6 +3641,7 @@ fn provider_to_info(name: &str, provider: &ProxyProvider) -> ProviderInfo {
             .as_ref()
             .map_or_else(String::new, |hc| hc.expected_status.clone()),
         updated_at: unix_rfc3339(provider.updated_at_secs()),
+        subscription_info: provider.subscription_info(),
     }
 }
 

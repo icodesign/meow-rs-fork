@@ -2483,6 +2483,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "serde",
+ "serde_json",
  "serde_yaml",
  "smol_str",
  "tempfile",

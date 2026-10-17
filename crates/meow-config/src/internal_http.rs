@@ -159,6 +159,24 @@ pub async fn fetch(
     fetch_capped(url, proxy, headers, MAX_BODY_BYTES).await
 }
 
+/// A terminal (post-redirect) 2xx response: the body plus the response
+/// header fields in wire order. Header values that are not valid UTF-8 are
+/// dropped — every consumer reads ASCII metadata such as
+/// `subscription-userinfo`.
+pub struct FetchResponse {
+    pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+}
+
+/// [`fetch`], additionally returning the terminal response's headers.
+pub async fn fetch_response(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+) -> Result<FetchResponse> {
+    fetch_response_capped(url, proxy, headers, MAX_BODY_BYTES).await
+}
+
 /// [`fetch`] with the body cap as a parameter, so tests can exercise the
 /// oversize paths without transferring hundreds of megabytes.
 async fn fetch_capped(
@@ -167,11 +185,22 @@ async fn fetch_capped(
     headers: &[(String, String)],
     limit: usize,
 ) -> Result<Vec<u8>> {
+    fetch_response_capped(url, proxy, headers, limit)
+        .await
+        .map(|response| response.body)
+}
+
+async fn fetch_response_capped(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+    limit: usize,
+) -> Result<FetchResponse> {
     let mut current = Url::parse(url).map_err(|e| anyhow!("invalid URL '{url}': {e}"))?;
     let mut headers = headers.to_vec();
     for _ in 0..=MAX_REDIRECTS {
         match fetch_one(&current, proxy, &headers, limit).await? {
-            Outcome::Body(bytes) => return Ok(bytes),
+            Outcome::Body(response) => return Ok(response),
             Outcome::Redirect(next) => {
                 let next = current
                     .join(&next)
@@ -197,7 +226,7 @@ async fn fetch_capped(
 }
 
 enum Outcome {
-    Body(Vec<u8>),
+    Body(FetchResponse),
     Redirect(String),
 }
 
@@ -453,7 +482,16 @@ fn parse_response(buf: &[u8], limit: usize) -> Result<Outcome> {
         }
         body.to_vec()
     };
-    Ok(Outcome::Body(body))
+    let headers = resp
+        .headers
+        .iter()
+        .filter_map(|h| {
+            std::str::from_utf8(h.value)
+                .ok()
+                .map(|value| (h.name.to_string(), value.trim().to_string()))
+        })
+        .collect();
+    Ok(Outcome::Body(FetchResponse { body, headers }))
 }
 
 fn decode_chunked(mut input: &[u8], limit: usize) -> Result<Vec<u8>> {
@@ -511,7 +549,7 @@ mod tests {
     fn parse_response_decodes_chunked_body_and_extensions() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;foo=bar\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Trailer: yes\r\n\r\n";
         match parse_response(response, MAX_BODY_BYTES).unwrap() {
-            Outcome::Body(body) => assert_eq!(body, b"Wikipedia"),
+            Outcome::Body(response) => assert_eq!(response.body, b"Wikipedia"),
             Outcome::Redirect(_) => panic!("unexpected redirect"),
         }
     }
@@ -649,6 +687,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_response_returns_terminal_headers() {
+        let url = spawn_raw_http_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSubscription-Userinfo: upload=1; total=9 \r\n\r\nok",
+        )
+        .await;
+        let response = fetch_response(&url, None, &[]).await.unwrap();
+        assert_eq!(response.body, b"ok");
+        let userinfo = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("subscription-userinfo"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(userinfo, Some("upload=1; total=9"));
+    }
+
+    #[tokio::test]
     async fn direct_fetch_rejects_truncated_content_length() {
         let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc").await;
         let error = fetch_direct(&url).await.unwrap_err();
@@ -664,7 +718,7 @@ mod tests {
             assert!(parse_response(response, MAX_BODY_BYTES).is_err());
         }
         assert!(
-            matches!(parse_response(b"HTTP/1.1 200 OK\r\n\r\nabc", MAX_BODY_BYTES).unwrap(), Outcome::Body(body) if body == b"abc")
+            matches!(parse_response(b"HTTP/1.1 200 OK\r\n\r\nabc", MAX_BODY_BYTES).unwrap(), Outcome::Body(response) if response.body == b"abc")
         );
     }
 
