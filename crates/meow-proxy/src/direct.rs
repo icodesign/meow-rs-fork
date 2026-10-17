@@ -1,12 +1,17 @@
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
 use meow_dns::Resolver;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
+use tracing::{debug, info, warn};
+
+const HAPPY_EYEBALLS_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 pub struct DirectAdapter {
     /// `Direct` normally; `Compatible` for the built-in `COMPATIBLE`
@@ -159,6 +164,64 @@ impl DirectAdapter {
             "direct: metadata has no destination".into(),
         ))
     }
+}
+
+fn interleave_address_families(targets: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(first) = targets.first() else {
+        return targets;
+    };
+    let first_is_v6 = first.is_ipv6();
+    let mut preferred = std::collections::VecDeque::new();
+    let mut alternate = std::collections::VecDeque::new();
+
+    for target in targets {
+        if target.is_ipv6() == first_is_v6 {
+            preferred.push_back(target);
+        } else {
+            alternate.push_back(target);
+        }
+    }
+
+    let mut interleaved = Vec::with_capacity(preferred.len() + alternate.len());
+    while !preferred.is_empty() || !alternate.is_empty() {
+        if let Some(target) = preferred.pop_front() {
+            interleaved.push(target);
+        }
+        if let Some(target) = alternate.pop_front() {
+            interleaved.push(target);
+        }
+    }
+    interleaved
+}
+
+async fn connect_staggered<T, E, F, Fut>(
+    targets: Vec<SocketAddr>,
+    attempt_delay: Duration,
+    connect: F,
+) -> std::result::Result<(T, SocketAddr, usize), Vec<(SocketAddr, E)>>
+where
+    F: Fn(SocketAddr) -> Fut + Clone,
+    Fut: Future<Output = std::result::Result<T, E>>,
+{
+    let mut pending = FuturesUnordered::new();
+    for (attempt, target) in targets.into_iter().enumerate() {
+        let connect = connect.clone();
+        pending.push(async move {
+            if attempt > 0 {
+                tokio::time::sleep(attempt_delay.saturating_mul(attempt as u32)).await;
+            }
+            (target, attempt, connect(target).await)
+        });
+    }
+
+    let mut errors = Vec::new();
+    while let Some((target, attempt, result)) = pending.next().await {
+        match result {
+            Ok(value) => return Ok((value, target, attempt)),
+            Err(error) => errors.push((target, error)),
+        }
+    }
+    Err(errors)
 }
 
 impl Default for DirectAdapter {
@@ -333,28 +396,58 @@ impl ProxyAdapter for DirectAdapter {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        let dests = self.resolve_targets(metadata).await?;
-        let mut last_err = None;
+        let targets = interleave_address_families(self.resolve_targets(metadata).await?);
+        let routing_mark = self.routing_mark;
+        let connect_timeout = self.connect_timeout;
+        let result = connect_staggered(
+            targets,
+            HAPPY_EYEBALLS_ATTEMPT_DELAY,
+            move |destination| async move {
+                let result = apply_connect_timeout(
+                    connect_with_mark(destination, routing_mark),
+                    connect_timeout,
+                    destination,
+                )
+                .await;
+                if let Err(error) = &result {
+                    warn!(
+                        target: "meow_proxy::direct",
+                        %destination,
+                        address_family = if destination.is_ipv6() { "ipv6" } else { "ipv4" },
+                        "direct tcp connect attempt failed: {error}"
+                    );
+                }
+                result
+            },
+        )
+        .await;
 
-        for dest in dests {
-            match apply_connect_timeout(
-                connect_with_mark(dest, self.routing_mark),
-                self.connect_timeout,
-                dest,
-            )
-            .await
-            {
-                Ok(stream) => return Ok(Box::new(DirectConn(stream))),
-                // An errno-backed connect failure (e.g. EMFILE on
-                // socket()) outranks a later context-only error — the
-                // errno is what dead-mark classification reads (issue
-                // #668); this error also escapes through relay hop-0 /
-                // dialer-proxy front boundaries.
-                Err(err) => last_err = MeowError::prefer_errno(last_err, err),
+        match result {
+            Ok((stream, destination, attempt)) => {
+                if attempt == 0 {
+                    debug!(
+                        target: "meow_proxy::direct",
+                        %destination,
+                        "direct tcp connected"
+                    );
+                } else {
+                    info!(
+                        target: "meow_proxy::direct",
+                        %destination,
+                        attempt = attempt + 1,
+                        address_family = if destination.is_ipv6() { "ipv6" } else { "ipv4" },
+                        "direct tcp connected through staggered fallback"
+                    );
+                }
+                Ok(Box::new(DirectConn(stream)))
             }
+            Err(errors) => Err(errors
+                .into_iter()
+                .fold(None, |previous, (_, error)| {
+                    MeowError::prefer_errno(previous, error)
+                })
+                .unwrap_or_else(|| MeowError::Proxy("direct: no reachable address".into()))),
         }
-
-        Err(last_err.unwrap_or_else(|| MeowError::Proxy("direct: no reachable address".into())))
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -544,6 +637,48 @@ mod tests {
             .await
             .expect("COMPATIBLE must bind a UDP session");
         assert!(udp.local_addr().unwrap().is_ipv4());
+    }
+
+    #[test]
+    fn interleave_address_families_preserves_preference_and_alternates() {
+        let targets = vec![
+            "[2001:db8::1]:443".parse().unwrap(),
+            "[2001:db8::2]:443".parse().unwrap(),
+            "192.0.2.1:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+        ];
+
+        let interleaved = interleave_address_families(targets);
+
+        assert!(interleaved[0].is_ipv6());
+        assert!(interleaved[1].is_ipv4());
+        assert!(interleaved[2].is_ipv6());
+        assert!(interleaved[3].is_ipv4());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staggered_connect_uses_alternate_family_when_first_attempt_hangs() {
+        let ipv6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let ipv4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let task = tokio::spawn(connect_staggered(
+            vec![ipv6, ipv4],
+            HAPPY_EYEBALLS_ATTEMPT_DELAY,
+            move |target| async move {
+                if target.is_ipv6() {
+                    std::future::pending::<std::result::Result<SocketAddr, &'static str>>().await
+                } else {
+                    Ok(target)
+                }
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(HAPPY_EYEBALLS_ATTEMPT_DELAY).await;
+
+        let (connected, _, attempt) = task.await.unwrap().unwrap();
+        assert_eq!(connected, ipv4);
+        assert_eq!(attempt, 1);
     }
 
     /// Regression for QUIC/HTTP3 direct: `dial_udp` must bind the reply socket
