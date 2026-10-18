@@ -1788,11 +1788,12 @@ fn insert_parsed_leaves(
     proxies: &mut HashMap<SmolStr, Arc<dyn Proxy>>,
     static_proxy_names: &mut std::collections::HashSet<SmolStr>,
     raw_proxies: &[HashMap<String, serde_yaml::Value>],
+    resolver: Option<&meow_dns::ResolverSlot>,
     ipv6: bool,
     strict: bool,
 ) -> Result<(), anyhow::Error> {
     for raw_proxy in raw_proxies {
-        let proxy = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
+        let proxy = match proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver) {
             Ok(proxy) => proxy,
             Err(e) if strict => {
                 let name = raw_proxy
@@ -2023,6 +2024,7 @@ fn build_proxy_layer(
         &mut proxies,
         &mut static_proxy_names,
         raw.proxies.as_deref().unwrap_or(&[]),
+        resolver,
         ipv6,
         strict,
     )?;
@@ -4835,7 +4837,7 @@ mod dialer_proxy_tests {
         let mut names = std::collections::HashSet::new();
 
         tracing::subscriber::with_default(subscriber, || {
-            insert_parsed_leaves(&mut proxies, &mut names, &raws, false, false).unwrap();
+            insert_parsed_leaves(&mut proxies, &mut names, &raws, None, false, false).unwrap();
         });
 
         assert_eq!(proxies.len(), 1, "last-wins is unchanged");
