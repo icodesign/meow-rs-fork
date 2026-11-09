@@ -1114,9 +1114,24 @@ async fn run_singbox_uot_session(
                                 break;
                             };
                             let uot = is_uot_magic(&stream.buf[..n]);
+                            let port = u16::from_be_bytes([stream.buf[n - 2], stream.buf[n - 1]]);
                             stream.buf.drain(..n);
                             if uot {
                                 stream.stage = FakeUotStage::Request;
+                            } else if port == FAKE_REFUSED_PORT {
+                                // Outbound dial failed: SYNACK carries the
+                                // error message (protocol v2).
+                                write_anytls_frame(
+                                    &mut writer,
+                                    Command::SynAck,
+                                    stream_id,
+                                    b"connection refused",
+                                )
+                                .await?;
+                                stream.stage = FakeUotStage::Dead;
+                            } else if port == FAKE_SILENT_PORT {
+                                // A server that never SYNACKs (protocol v1).
+                                stream.stage = FakeUotStage::Dead;
                             } else {
                                 // Non-UoT destination: SYNACK immediately,
                                 // the vendored server's unconditional shape.
@@ -1166,6 +1181,11 @@ async fn run_singbox_uot_session(
         }
     }
 }
+
+/// Destination port the fake refuses with an error SYNACK.
+const FAKE_REFUSED_PORT: u16 = 9;
+/// Destination port the fake never SYNACKs, like a protocol v1 server.
+const FAKE_SILENT_PORT: u16 = 7;
 
 /// Start the sing-box-ordered fake AnyTLS server; returns its bound addr.
 async fn start_singbox_uot_server(
@@ -1279,6 +1299,83 @@ async fn anytls_tcp_gets_immediate_synack_from_singbox_ordered_fake() {
         .expect("tcp write must not stall")
         .expect("tcp write must succeed");
     conn.flush().await.unwrap();
+}
+
+fn tcp_metadata(port: u16) -> Metadata {
+    Metadata {
+        network: Network::Tcp,
+        host: smol_str::SmolStr::from("192.0.2.2"),
+        dst_ip: Some("192.0.2.2".parse().unwrap()),
+        dst_port: port,
+        ..Default::default()
+    }
+}
+
+/// `dial_tcp` hands the stream back without waiting for SYNACK, like the
+/// reference clients (mihomo / sing-anytls `CreateProxy`), so a server that
+/// never SYNACKs (protocol v1) neither stalls the dial nor blocks the first
+/// write. Waiting cost every stream one extra round trip.
+#[tokio::test]
+async fn anytls_tcp_dial_does_not_wait_for_synack() {
+    install_crypto_provider();
+
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_singbox_uot_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-tcp-no-synack",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    let mut conn = timeout(T, adapter.dial_tcp(&tcp_metadata(FAKE_SILENT_PORT)))
+        .await
+        .expect("dial_tcp must not wait for a SYNACK that never comes")
+        .expect("dial_tcp must succeed");
+    timeout(T, conn.write_all(b"GET / HTTP/1.0\r\n\r\n"))
+        .await
+        .expect("tcp write must not stall")
+        .expect("tcp write must succeed");
+    conn.flush().await.unwrap();
+}
+
+/// A SYNACK carrying an error (the server's outbound dial failed) arrives
+/// after `dial_tcp` returned; it must close the stream so the caller's
+/// read ends promptly instead of hanging — mihomo surfaces it the same way,
+/// on the next read.
+#[tokio::test]
+async fn anytls_tcp_error_synack_ends_the_stream() {
+    install_crypto_provider();
+
+    let (cert, key) = self_signed_cert();
+    let (server_addr, _server_h) = start_singbox_uot_server(cert, key).await;
+    let adapter = AnytlsAdapter::new(
+        "test-anytls-tcp-refused",
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        PASSWORD,
+        Some("localhost"),
+        true,
+        true,
+    )
+    .expect("adapter must build");
+
+    let mut conn = timeout(T, adapter.dial_tcp(&tcp_metadata(FAKE_REFUSED_PORT)))
+        .await
+        .expect("dial_tcp must not stall")
+        .expect("dial_tcp returns before the error SYNACK arrives");
+    let mut buf = [0u8; 16];
+    let read = timeout(T, conn.read(&mut buf))
+        .await
+        .expect("an error SYNACK must end the stream, not leave the read hanging");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "a refused stream must not yield data: {read:?}"
+    );
 }
 
 /// Issue #570 — `connect_over` must apply the adapter's TLS layer to the
